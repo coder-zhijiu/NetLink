@@ -49,7 +49,7 @@ NetLink 是一款面向电力/工业现场调试的**多协议主/从机模拟�
 
 ## 下载与安装
 
-从 [Releases](https://github.com/coder-liushuo/NetLink/releases/latest) 下载 v1.0.0：
+从 [Releases](https://github.com/coder-zhijiu/NetLink/releases/latest) 下载 v1.0.0：
 
 | 文件 | 说明 |
 |---|---|
