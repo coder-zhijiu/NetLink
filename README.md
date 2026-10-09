@@ -102,15 +102,16 @@ NetLink 是一款面向电力/工业现场调试的**多协议主/从机模拟�
 pnpm --dir web install
 
 # 开发模式（热更新）
-pnpm --dir web exec tauri dev --config netlink-app/tauri.conf.json
+./web/node_modules/.bin/tauri dev
 
 # 打安装包（产出 target/release/bundle/nsis/*.exe）
-pnpm --dir web exec tauri build --config netlink-app/tauri.conf.json
+./web/node_modules/.bin/tauri build
 
 # 跑测试
 cargo test
 ```
 
+> Windows CMD/PowerShell 下把 `./web/node_modules/.bin/tauri` 换成 `web\node_modules\.bin\tauri.cmd`。
 > 纯前端浏览器演示模式（无需 Rust）：`pnpm --dir web dev` 后访问 http://localhost:5173 ，内置 mock 引擎可完整体验 UI。
 
 ## 项目结构
