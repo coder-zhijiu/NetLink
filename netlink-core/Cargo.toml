@@ -1,0 +1,17 @@
+[package]
+name = "netlink-core"
+description = "NetLink 协议引擎核心库：点表模型、数据仿真、Modbus 主/从机"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+serialport.workspace = true
+calamine.workspace = true
+rust_xlsxwriter.workspace = true
+csv.workspace = true

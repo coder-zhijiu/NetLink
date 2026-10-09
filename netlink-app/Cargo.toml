@@ -1,0 +1,20 @@
+[package]
+name = "netlink-app"
+description = "NetLink 多协议工业主/从机模拟器桌面应用（Tauri 2 壳）"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+netlink-core = { path = "../netlink-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+serialport.workspace = true
+
+[features]
+default = []

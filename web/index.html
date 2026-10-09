@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NetLink 协议模拟器</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      // 开发期兜底：把未捕获错误画到页面顶部（Vite 只显示编译错误）
+      window.__showErr = (msg) => {
+        const d = document.createElement('div')
+        d.style.cssText =
+          'position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;padding:8px 12px;font:12px monospace;white-space:pre-wrap'
+        d.textContent = '运行时错误: ' + msg
+        document.body.appendChild(d)
+      }
+      window.addEventListener('error', (e) => window.__showErr(e.message + ' @ ' + (e.filename || '') + ':' + e.lineno))
+      window.addEventListener('unhandledrejection', (e) => window.__showErr(String(e.reason)))
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

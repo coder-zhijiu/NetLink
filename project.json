@@ -1,0 +1,512 @@
+{
+  "schema_version": 2,
+  "name": "演示工程 · 一号站",
+  "connections": [
+    {
+      "id": 1,
+      "name": "TCP 主网 (502)",
+      "transport": {
+        "kind": "tcp_server",
+        "listen_addr": "0.0.0.0",
+        "port": 502
+      },
+      "devices": [
+        {
+          "id": 101,
+          "name": "1号测控装置",
+          "slave_id": 1,
+          "enabled": true,
+          "fault": {
+            "kind": "normal"
+          },
+          "poll_period_ms": 1000,
+          "points": [
+            {
+              "id": 101,
+              "name": "A相电压",
+              "area": "input_register",
+              "address": 0,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 60.0,
+                "amplitude": 5.0,
+                "offset": 220.0
+              }
+            },
+            {
+              "id": 102,
+              "name": "B相电压",
+              "area": "input_register",
+              "address": 2,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 60.0,
+                "amplitude": 5.0,
+                "offset": 220.0
+              }
+            },
+            {
+              "id": 103,
+              "name": "C相电压",
+              "area": "input_register",
+              "address": 4,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 60.0,
+                "amplitude": 5.0,
+                "offset": 220.0
+              }
+            },
+            {
+              "id": 104,
+              "name": "A相电流",
+              "area": "input_register",
+              "address": 6,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 20.0,
+                "amplitude": 30.0,
+                "offset": 55.0
+              }
+            },
+            {
+              "id": 105,
+              "name": "B相电流",
+              "area": "input_register",
+              "address": 8,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 20.0,
+                "amplitude": 30.0,
+                "offset": 52.0
+              }
+            },
+            {
+              "id": 106,
+              "name": "C相电流",
+              "area": "input_register",
+              "address": 10,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 20.0,
+                "amplitude": 30.0,
+                "offset": 57.0
+              }
+            },
+            {
+              "id": 107,
+              "name": "有功功率",
+              "area": "input_register",
+              "address": 12,
+              "data_type": "f32",
+              "source": {
+                "kind": "random_walk",
+                "step": 2.0,
+                "min": 0.0,
+                "max": 400.0
+              }
+            },
+            {
+              "id": 108,
+              "name": "无功功率",
+              "area": "input_register",
+              "address": 14,
+              "data_type": "f32",
+              "source": {
+                "kind": "random_walk",
+                "step": 1.0,
+                "min": 0.0,
+                "max": 150.0
+              }
+            },
+            {
+              "id": 109,
+              "name": "频率",
+              "area": "input_register",
+              "address": 16,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 30.0,
+                "amplitude": 0.2,
+                "offset": 50.0
+              }
+            },
+            {
+              "id": 110,
+              "name": "功率因数",
+              "area": "input_register",
+              "address": 18,
+              "data_type": "f32",
+              "source": {
+                "kind": "swing",
+                "min": 0.85,
+                "max": 0.99,
+                "period_s": 45.0
+              }
+            },
+            {
+              "id": 111,
+              "name": "正向有功电能",
+              "area": "input_register",
+              "address": 20,
+              "data_type": "f32",
+              "source": {
+                "kind": "ramp",
+                "step": 0.05,
+                "min": 0.0,
+                "max": 999999.0
+              }
+            },
+            {
+              "id": 112,
+              "name": "有功遥测",
+              "area": "input_register",
+              "address": 24,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 15.0,
+                "amplitude": 80.0,
+                "offset": 200.0
+              }
+            },
+            {
+              "id": 113,
+              "name": "遥信合位",
+              "area": "coil",
+              "address": 0,
+              "data_type": "u16",
+              "source": {
+                "kind": "static",
+                "value": 1.0
+              }
+            },
+            {
+              "id": 114,
+              "name": "遥信分位",
+              "area": "coil",
+              "address": 1,
+              "data_type": "u16",
+              "source": {
+                "kind": "static",
+                "value": 0.0
+              }
+            },
+            {
+              "id": 115,
+              "name": "远方/就地",
+              "area": "discrete_input",
+              "address": 0,
+              "data_type": "u16",
+              "source": {
+                "kind": "static",
+                "value": 1.0
+              }
+            },
+            {
+              "id": 116,
+              "name": "温度",
+              "area": "input_register",
+              "address": 30,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 120.0,
+                "amplitude": 8.0,
+                "offset": 36.0
+              }
+            },
+            {
+              "id": 117,
+              "name": "湿度",
+              "area": "input_register",
+              "address": 32,
+              "data_type": "f32",
+              "source": {
+                "kind": "random_walk",
+                "step": 1.0,
+                "min": 30.0,
+                "max": 80.0
+              }
+            },
+            {
+              "id": 118,
+              "name": "有功设定",
+              "area": "holding_register",
+              "address": 0,
+              "data_type": "f32",
+              "source": {
+                "kind": "static",
+                "value": 250.0
+              }
+            },
+            {
+              "id": 119,
+              "name": "无功设定",
+              "area": "holding_register",
+              "address": 2,
+              "data_type": "f32",
+              "source": {
+                "kind": "static",
+                "value": 30.0
+              }
+            }
+          ]
+        },
+        {
+          "id": 102,
+          "name": "2号测控装置",
+          "slave_id": 2,
+          "enabled": true,
+          "fault": {
+            "kind": "delay",
+            "delay_ms": 200
+          },
+          "poll_period_ms": 1000,
+          "points": [
+            {
+              "id": 120,
+              "name": "A相电压",
+              "area": "input_register",
+              "address": 0,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 50.0,
+                "amplitude": 3.0,
+                "offset": 221.0
+              }
+            },
+            {
+              "id": 121,
+              "name": "A相电流",
+              "area": "input_register",
+              "address": 2,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 25.0,
+                "amplitude": 20.0,
+                "offset": 40.0
+              }
+            },
+            {
+              "id": 122,
+              "name": "总有功",
+              "area": "input_register",
+              "address": 4,
+              "data_type": "f32",
+              "source": {
+                "kind": "random_walk",
+                "step": 3.0,
+                "min": 10.0,
+                "max": 200.0
+              }
+            },
+            {
+              "id": 123,
+              "name": "正向有功电能",
+              "area": "input_register",
+              "address": 6,
+              "data_type": "f32",
+              "source": {
+                "kind": "ramp",
+                "step": 0.03,
+                "min": 0.0,
+                "max": 999999.0
+              }
+            },
+            {
+              "id": 124,
+              "name": "遥信合位",
+              "area": "coil",
+              "address": 0,
+              "data_type": "u16",
+              "source": {
+                "kind": "static",
+                "value": 1.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "485 总线 (COM3)",
+      "transport": {
+        "kind": "serial",
+        "serial_port": "COM3",
+        "baud": 9600,
+        "parity": "none",
+        "stop_bits": 1
+      },
+      "devices": [
+        {
+          "id": 201,
+          "name": "1号电表",
+          "slave_id": 1,
+          "enabled": false,
+          "fault": {
+            "kind": "normal"
+          },
+          "poll_period_ms": 1000,
+          "points": [
+            {
+              "id": 125,
+              "name": "电压",
+              "area": "input_register",
+              "address": 0,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 40.0,
+                "amplitude": 4.0,
+                "offset": 220.0
+              }
+            },
+            {
+              "id": 126,
+              "name": "电流",
+              "area": "input_register",
+              "address": 2,
+              "data_type": "f32",
+              "source": {
+                "kind": "sine",
+                "period_s": 18.0,
+                "amplitude": 10.0,
+                "offset": 15.0
+              }
+            },
+            {
+              "id": 127,
+              "name": "功率",
+              "area": "input_register",
+              "address": 4,
+              "data_type": "f32",
+              "source": {
+                "kind": "random_walk",
+                "step": 0.5,
+                "min": 1.0,
+                "max": 30.0
+              }
+            },
+            {
+              "id": 128,
+              "name": "电能量",
+              "area": "input_register",
+              "address": 6,
+              "data_type": "f32",
+              "source": {
+                "kind": "ramp",
+                "step": 0.01,
+                "min": 0.0,
+                "max": 999999.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "主机采集 → 本机从机",
+      "transport": {
+        "kind": "tcp_client",
+        "host": "127.0.0.1",
+        "port": 502,
+        "timeout_ms": 1000
+      },
+      "devices": [
+        {
+          "id": 301,
+          "name": "1号测控装置(采集)",
+          "slave_id": 1,
+          "enabled": true,
+          "fault": {
+            "kind": "normal"
+          },
+          "poll_period_ms": 1000,
+          "points": [
+            {
+              "id": 129,
+              "name": "A相电压",
+              "area": "input_register",
+              "address": 0,
+              "data_type": "f32",
+              "source": {
+                "kind": "static",
+                "value": 0.0
+              }
+            },
+            {
+              "id": 130,
+              "name": "有功遥测",
+              "area": "input_register",
+              "address": 24,
+              "data_type": "f32",
+              "source": {
+                "kind": "static",
+                "value": 0.0
+              }
+            },
+            {
+              "id": 131,
+              "name": "遥信合位",
+              "area": "coil",
+              "address": 0,
+              "data_type": "u16",
+              "source": {
+                "kind": "static",
+                "value": 0.0
+              }
+            },
+            {
+              "id": 132,
+              "name": "有功设定",
+              "area": "holding_register",
+              "address": 0,
+              "data_type": "f32",
+              "source": {
+                "kind": "static",
+                "value": 0.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 100000,
+      "name": "主机采集->本机从机(COM3)",
+      "transport": {
+        "kind": "serial_master",
+        "serial_port": "COM3",
+        "baud": 9600,
+        "parity": "none",
+        "stop_bits": 1,
+        "timeout_ms": 1000
+      },
+      "devices": [
+        {
+          "id": 200000,
+          "name": "1号测控装置",
+          "slave_id": 1,
+          "enabled": true,
+          "fault": {
+            "kind": "normal"
+          },
+          "poll_period_ms": 1000,
+          "points": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+# Rust
+/target
+
+# 前端
+web/node_modules/
+web/dist/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 私有/过程文件（不进仓库）
+doc/subagent-config.md
+doc/*.png
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace

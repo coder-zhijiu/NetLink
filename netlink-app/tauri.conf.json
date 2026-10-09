@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NetLink",
+  "version": "1.0.0",
+  "identifier": "com.netlink.simulator",
+  "build": {
+    "beforeDevCommand": "pnpm --dir web dev",
+    "beforeBuildCommand": "pnpm --dir web build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../web/dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "NetLink 协议模拟器",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"]
+  }
+}

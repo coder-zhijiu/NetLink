@@ -1,0 +1,207 @@
+:root {
+  --bg: #eef1f3;
+  --panel: #ffffff;
+  --border: #d9e0e4;
+  --text: #1c2b33;
+  --text-2: #5d6f7a;
+  --primary: #0e7490;
+  --primary-dark: #0a5c73;
+  --header-bg: #142e38;
+  --header-text: #e8f1f4;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --err: #dc2626;
+  --mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+}
+
+button {
+  font-family: inherit;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+button:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+button.primary:hover {
+  background: var(--primary-dark);
+  color: #fff;
+}
+
+button.danger:hover {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+input,
+select {
+  font-family: inherit;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  color: var(--text);
+  background: #fff;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+input[type='number'] {
+  font-family: var(--mono);
+}
+
+/* ---------- 整体三段布局 ---------- */
+.app-root {
+  display: grid;
+  grid-template-rows: auto 1fr 260px;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* grid 子项默认 min-width:auto 会卡在内容宽度，必须放开才能随窗口缩窄 */
+.app-main {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  gap: 6px;
+  padding: 6px;
+}
+
+.app-tree {
+  width: 264px;
+  flex: none;
+}
+
+.app-points {
+  flex: 1;
+  min-width: 0;
+}
+
+.app-monitor {
+  min-height: 0;
+  min-width: 0;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: #f7fafb;
+  flex: none;
+}
+
+.panel-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ---------- 通用小组件 ---------- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 8px;
+  line-height: 18px;
+  color: var(--text-2);
+  background: #fff;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #b6c2c8;
+  flex: none;
+}
+
+.dot.on {
+  background: var(--ok);
+  box-shadow: 0 0 4px var(--ok);
+}
+
+.dot.warn {
+  background: var(--warn);
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c3ccd1;
+  border-radius: 5px;
+  border: 2px solid var(--panel);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

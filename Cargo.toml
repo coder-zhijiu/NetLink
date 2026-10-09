@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["netlink-core", "netlink-app"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "2"
+rand = "0.9"
+serialport = "4"
+# 点表导入导出：xlsx 读写（calamine 读 + rust_xlsxwriter 写）、CSV（含 BOM）
+calamine = "0.28"
+rust_xlsxwriter = "0.9"
+csv = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
