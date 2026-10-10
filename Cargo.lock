@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "netlink-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "netlink-core",
  "serde",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "netlink-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "calamine",
  "csv",
