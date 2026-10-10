@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import {
   store,
@@ -76,7 +76,11 @@ function connTooltip(conn: Connection): string {
       (n, node) => n + node.frames.filter((f) => f.enabled && f.period_ms > 0).length,
       0,
     )
-    lines.push(`CAN 连接：直采直控（周期报文 ${periodic} 条）`)
+    lines.push(
+      conn.transport.kind === 'can_net'
+        ? `CAN 转以太网连接（ZLG CANET 透传，周期报文 ${periodic} 条）`
+        : `CAN 连接：直采直控（周期报文 ${periodic} 条）`,
+    )
     const agg = store.canRx[conn.id]
     if (agg && connRunning(conn.id)) {
       lines.push(
@@ -356,6 +360,16 @@ const connEdit = reactive<ConnEditState>({
 
 const connEditorOpen = ref(false)
 const serialPorts = ref<string[]>([])
+
+// 切到 can_net 时给一个工作端口默认值（Modbus 默认端口对 CANET 无意义）
+watch(
+  () => connEdit.kind,
+  (kind, old) => {
+    if (kind === 'can_net' && old !== 'can_net' && [502, 5020].includes(connEdit.port)) {
+      connEdit.port = 4001
+    }
+  },
+)
 
 /** 连接编辑器检测结果（「测试连接 / 检查端口 / 检查串口」） */
 const connTest = reactive<{ busy: boolean; result: TestConnResult | null }>({
@@ -854,7 +868,7 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
           <option value="serial">{{ TRANSPORT_LABELS['serial'] }}</option>
           <option value="serial_master">{{ TRANSPORT_LABELS['serial_master'] }}</option>
           <option value="usb_can">{{ TRANSPORT_LABELS['usb_can'] }}</option>
-          <option value="can_net">{{ TRANSPORT_LABELS['can_net'] }}（M3 未实现）</option>
+          <option value="can_net">{{ TRANSPORT_LABELS['can_net'] }}</option>
         </select>
       </label>
 
@@ -931,20 +945,22 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
       <div v-else-if="connEdit.kind === 'can_net'" class="f-group">
         <div class="f-row">
           <span class="f-lab">网关地址</span>
-          <input v-model="connEdit.host" placeholder="192.168.1.100" class="mono" />
-          <span class="f-lab f-lab2">端口</span>
-          <input v-model.number="connEdit.port" type="number" min="1" max="65535" class="mono" style="flex: 0.6" />
+          <input v-model="connEdit.host" placeholder="192.168.0.178" class="mono" />
+          <span class="f-lab f-lab2">工作端口</span>
+          <input v-model.number="connEdit.port" type="number" min="1" max="65535" class="mono" style="flex: 0.7" />
+          <button class="mini" title="CAN0 默认 4001" @click="connEdit.port = 4001">4001</button>
+          <button class="mini" title="CAN1 默认 4002" @click="connEdit.port = 4002">4002</button>
         </div>
         <div class="f-row">
-          <span class="f-lab">CAN 通道</span>
+          <span class="f-lab" title="网关每路 CAN 有独立工作端口（CAN0=4001、CAN1=4002，设备可改）；帧内不含通道字节，端口即通道">CAN 通道</span>
           <select v-model.number="connEdit.canChannel">
-            <option :value="0">0</option>
-            <option :value="1">1</option>
+            <option :value="0">0（对应 4001）</option>
+            <option :value="1">1（对应 4002）</option>
           </select>
           <span class="f-lab f-lab2">超时(ms)</span>
-          <input v-model.number="connEdit.timeoutMs" type="number" min="50" step="50" class="mono" />
+          <input v-model.number="connEdit.timeoutMs" type="number" min="200" step="100" class="mono" />
         </div>
-        <p class="tip">CAN 转以太网（ZLG CANET-2E 网关，TCP 透传）：尚未实现（M3，等网关到货），连接暂不能启动；「测试连接」可先验证网关可达。</p>
+        <p class="tip">CAN 转以太网（ZLG CANET-E(2E)，TCP 透传 13 字节帧）：连接网关的工作端口收发 CAN 帧，断线自动退避重连（1s→5s→30s）。保存前可「测试连接」验证网关可达；网关侧需配为 TCP Server 模式。</p>
       </div>
 
       <div v-else class="f-group">

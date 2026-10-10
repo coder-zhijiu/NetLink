@@ -22,6 +22,7 @@ use crate::protocol::hex_str;
 use crate::runtime::{now_ms, ConnStateKind, RuntimeManager};
 
 pub mod slcan;
+pub mod zlg_canet;
 
 /// 一条 CAN 经典帧
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -254,7 +255,7 @@ pub async fn serve_can_with(
 
     let handle = tokio::task::spawn_blocking(move || {
         let mut io = io;
-        can_loop(&ctx, io.as_mut(), &stop_flag, &mut rx);
+        let _ = can_loop(&ctx, io.as_mut(), &stop_flag, &mut rx, false);
     });
 
     let _ = handle.await;
@@ -268,13 +269,16 @@ struct PeriodicSlot {
     next_due: Instant,
 }
 
-/// CAN 主循环：到期周期报文发送 + 收帧聚合 + 命令插队 + 500ms 统计采样
-fn can_loop(
+/// CAN 主循环：到期周期报文发送 + 收帧聚合 + 命令插队 + 500ms 统计采样。
+/// `fatal_io = true` 时 IO 错误直接上抛（CanNet 用：断线交给外层重连）；
+/// false 时记链路徽章原地重试（slcan 用：串口无连接概念）。
+pub(crate) fn can_loop(
     ctx: &Arc<CanCtx>,
     io: &mut dyn CanIo,
     stop_flag: &AtomicBool,
     rx: &mut mpsc::Receiver<CanMsg>,
-) {
+    fatal_io: bool,
+) -> Result<(), String> {
     // 节点在线状态查表（启停不重启，同 Modbus 设备）
     let node_map: std::collections::HashMap<u64, Arc<Mutex<CanNodeRuntime>>> = ctx
         .nodes
@@ -301,7 +305,7 @@ fn can_loop(
 
     loop {
         if stop_flag.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         let now = Instant::now();
 
@@ -318,10 +322,14 @@ fn can_loop(
                     remote: slot.def.remote,
                     data: slot.def.data.clone(),
                 };
-                if let Err(e) = send_frame(ctx, io, &frame, Some(slot.node_id)) {
-                    mark_link_error(ctx, &mut link_error, e);
-                } else {
-                    clear_link_error(ctx, &mut link_error);
+                match send_frame(ctx, io, &frame, Some(slot.node_id)) {
+                    Ok(()) => clear_link_error(ctx, &mut link_error),
+                    Err(e) => {
+                        if fatal_io {
+                            return Err(e);
+                        }
+                        mark_link_error(ctx, &mut link_error, e);
+                    }
                 }
             }
             slot.next_due = now + Duration::from_millis(slot.def.period_ms.max(10) as u64);
@@ -345,9 +353,13 @@ fn can_loop(
                     Some(f.note()),
                 ));
                 ctx.agg.lock().unwrap().on_rx(&f, now_ms());
+                clear_link_error(ctx, &mut link_error);
             }
             Ok(None) => {}
             Err(e) => {
+                if fatal_io {
+                    return Err(e);
+                }
                 mark_link_error(ctx, &mut link_error, e);
                 // 错误限速：持久故障（串口被拔等）立即返回会空转烧 CPU
                 std::thread::sleep(Duration::from_millis(20));
@@ -359,7 +371,11 @@ fn can_loop(
             match msg {
                 CanMsg::SendFrame { frame, reply } => {
                     let r = send_frame(ctx, io, &frame, None);
-                    let _ = reply.send(r);
+                    let _ = reply.send(r.clone());
+                    // 命令级 IO 失败同样触发断线重连（应答已交给调用方）
+                    if fatal_io {
+                        r?;
+                    }
                 }
             }
         }

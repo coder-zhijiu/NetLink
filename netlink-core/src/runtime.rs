@@ -677,6 +677,13 @@ impl RuntimeManager {
         let mut can_cmd_tx: Option<mpsc::Sender<CanMsg>> = None;
         let mut can_agg: Option<Arc<Mutex<CanAgg>>> = None;
 
+        // CAN 连接帧定义预校验（启动即暴露配置错误，而不是等到发送时静默失败）
+        for n in &conn.can_nodes {
+            for f in &n.frames {
+                f.validate().map_err(|e| format!("节点「{}」报文 id {}: {e}", n.name, f.id))?;
+            }
+        }
+
         match &conn.transport {
             Transport::TcpServer { listen_addr, port } => {
                 let listener = tokio::net::TcpListener::bind((listen_addr.as_str(), *port))
@@ -749,12 +756,6 @@ impl RuntimeManager {
                 if name.is_empty() {
                     return Err("slcan 后端需要配置串口（连接编辑器里选择）".to_string());
                 }
-                // 帧定义预校验：启动即暴露配置错误，而不是发送时静默失败
-                for n in &conn.can_nodes {
-                    for f in &n.frames {
-                        f.validate().map_err(|e| format!("节点「{}」报文 id {}: {e}", n.name, f.id))?;
-                    }
-                }
                 let io = crate::protocol::can::slcan::open(name, *serial_baud, *bitrate)?;
                 let (tx, rx) = mpsc::channel(64);
                 can_cmd_tx = Some(tx);
@@ -769,8 +770,27 @@ impl RuntimeManager {
                 let t = crate::protocol::can::serve_can_with(ctx, Box::new(io), cancel.clone(), rx);
                 tasks.push(tokio::spawn(t));
             }
-            Transport::CanNet { .. } => {
-                return Err("CAN 转以太网（ZLG CANET）尚未实现：等 CANET-2E 到货后启用（M3）".to_string());
+            Transport::CanNet { host, port, channel: _, timeout_ms } => {
+                // ZLG CANET 网关（TCP 工作端口，13 字节透传帧）：断线退避重连在引擎层完成
+                let (tx, rx) = mpsc::channel(64);
+                can_cmd_tx = Some(tx);
+                let agg = Arc::new(Mutex::new(CanAgg::default()));
+                can_agg = Some(agg.clone());
+                let ctx = Arc::new(crate::protocol::can::CanCtx {
+                    conn_id: conn.id,
+                    nodes: can_nodes.clone(),
+                    manager: self.clone(),
+                    agg,
+                });
+                let t = crate::protocol::can::zlg_canet::serve_can_net(
+                    ctx,
+                    host.clone(),
+                    *port,
+                    *timeout_ms,
+                    cancel.clone(),
+                    rx,
+                );
+                tasks.push(tokio::spawn(t));
             }
         }
 

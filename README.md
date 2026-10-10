@@ -140,7 +140,8 @@ NetLink/
 - [x] M1：Modbus TCP/RTU 主从模拟、故障注入、多工程管理、点表导入导出
 - [x] M2：故障注入增强（RTU 脏帧 CRC 错误 / TCP 断连）
 - [x] CAN-M1：CAN 直采直控（slcan 后端）——CAN 节点/周期报文、手动单帧发送、报文监视与 ID 聚合、帧率统计（[设计](doc/2026-10-10-CAN采集与控制设计.md)）
-- [ ] CAN-M2/M3：zlgcan 后端（USBCAN/CANalyst-II FFI）、CAN 转以太网（ZLG CANET）——等硬件到货
+- [x] CAN-M3：CAN 转以太网（ZLG CANET 透传，13 字节帧按官方手册）+ 断线退避重连
+- [ ] CAN-M2：zlgcan 后端（USBCAN/CANalyst-II FFI）——等硬件到货
 - [ ] M3：IEC 60870-5-104 被控站（手写 APDU/ASDU）
 - [ ] M4：DL/T 645-2007 多功能电能表模拟 + 104 主站
 

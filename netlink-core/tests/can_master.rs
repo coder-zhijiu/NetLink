@@ -359,17 +359,6 @@ async fn unsupported_can_backends_rejected_at_start() {
     let e = manager.start_connection(&conn).await.unwrap_err();
     assert!(e.contains("尚未实现"), "zlgcan 应被拒绝: {e}");
 
-    // can_net：M3 未实现
-    let conn = Connection {
-        id: 2,
-        name: "canet".into(),
-        transport: Transport::CanNet { host: "127.0.0.1".into(), port: 3333, channel: 0, timeout_ms: 1000 },
-        devices: vec![],
-        can_nodes: vec![],
-    };
-    let e = manager.start_connection(&conn).await.unwrap_err();
-    assert!(e.contains("M3"), "can_net 应被拒绝: {e}");
-
     // slcan 未配串口
     let conn = Connection {
         id: 3,
