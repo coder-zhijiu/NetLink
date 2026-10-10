@@ -1,4 +1,4 @@
-import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, ConnState, DevStat, Transport, TestConnResult } from '../types'
+import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, ConnState, DevStat, Transport, TestConnResult, CanAgg, CanFrame } from '../types'
 
 /** 运行时状态推送（mock 与 tauri 两种实现共用） */
 export interface RuntimePatch {
@@ -9,10 +9,12 @@ export interface RuntimePatch {
   running?: boolean
   /** 逐连接运行状态（连接 id 列表，空 = 全部停止） */
   running_conns?: number[]
-  /** 在线设备 id 列表（运行态，与工程配置的 enabled 解耦） */
+  /** 在线设备/CAN 节点 id 列表（运行态，与工程配置的 enabled 解耦） */
   running_devices?: number[]
   /** 主机连接链路状态（连接 id → 状态，替换式：连接停止后从推送中消失） */
   conn_states?: Record<number, ConnState>
+  /** CAN 连接观测（连接 id → 聚合/帧率，替换式） */
+  can_rx?: Record<number, CanAgg>
   paused?: boolean
 }
 
@@ -62,6 +64,9 @@ export interface NetLinkApi {
 
   /** 主机侧发送测试帧（PDU hex，不含 MBAP），返回应答 PDU hex */
   sendTestFrame(connId: number, unit: number, hex: string): Promise<string>
+
+  /** CAN 手动发送一帧（插队立即发出） */
+  sendCanFrame(connId: number, frame: CanFrame): Promise<void>
 
   /** 选一个点表文件并解析（.xlsx/.csv）：Tauri=系统文件对话框→后端解析；
    *  浏览器演示=file input 读文本（仅 CSV）。返回 null = 用户取消 */

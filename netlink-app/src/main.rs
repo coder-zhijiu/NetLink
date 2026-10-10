@@ -44,6 +44,7 @@ fn main() {
             commands::write_point_sheet,
             commands::write_point,
             commands::send_test_frame,
+            commands::send_can_frame,
         ])
         .run(tauri::generate_context!())
         .expect("NetLink 启动失败");

@@ -36,6 +36,7 @@ fn slave_project(port: u16) -> ProjectSpec {
                 listen_addr: "127.0.0.1".into(),
                 port,
             },
+            can_nodes: vec![],
             devices: vec![Device {
                 id: 901,
                 name: "从机装置".into(),
@@ -99,6 +100,7 @@ fn master_project(port: u16) -> ProjectSpec {
                 port,
                 timeout_ms: 400,
             },
+            can_nodes: vec![],
             devices: vec![Device {
                 id: 902,
                 name: "采集装置".into(),

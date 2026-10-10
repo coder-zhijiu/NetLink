@@ -9,32 +9,61 @@ import {
   addDevice,
   patchDevice,
   removeDevice,
+  addCanNode,
+  patchCanNode,
+  removeCanNode,
   nextConnId,
   nextDevId,
+  nextNodeId,
   nextPointId,
   connRunning,
   deviceRunning,
+  connOfId,
   restartConnIfRunning,
   runningDevicesOfConn,
 } from '../store'
-import type { Connection, Device, Transport, TransportKind, FaultKind, Parity, TestConnResult } from '../types'
-import { FAULT_LABELS, TRANSPORT_LABELS, isFaultKindAllowedForTransport, isMasterTransport } from '../types'
+import type { Connection, Device, Transport, TransportKind, FaultKind, Parity, TestConnResult, CanNode } from '../types'
+import {
+  FAULT_LABELS,
+  TRANSPORT_LABELS,
+  CAN_BACKEND_LABELS,
+  CAN_BITRATES,
+  isCanTransport,
+  isFaultKindAllowedForTransport,
+  isMasterTransport,
+} from '../types'
 import { uiAlert, uiConfirm } from '../ui-dialog'
 import DrawerShell from './DrawerShell.vue'
-import { openTestPanel } from '../store'
+import { openTestPanel, openCanPanel } from '../store'
 
 const project = computed(() => store.project)
 
-const allDevCount = computed(() => (store.project?.connections ?? []).reduce((n, c) => n + c.devices.length, 0))
+const allDevCount = computed(() =>
+  (store.project?.connections ?? []).reduce((n, c) => n + c.devices.length + (c.can_nodes?.length ?? 0), 0),
+)
 
 function isMasterConn(conn: Connection): boolean {
   return isMasterTransport(conn.transport.kind)
 }
 
+function isCanConn(conn: Connection): boolean {
+  return isCanTransport(conn.transport.kind)
+}
+
 function transportSummary(t: Transport): string {
   if (t.kind === 'tcp_server') return `TCP :${t.port ?? 502}`
   if (t.kind === 'tcp_client') return `→ ${t.host ?? '?'}:${t.port ?? 502}`
+  if (t.kind === 'usb_can') {
+    return t.backend === 'slcan'
+      ? `${t.serial_port ?? 'COM?'} · CAN@${fmtBitrate(t.bitrate ?? 500000)}`
+      : `${t.backend ?? '?'} #${t.device_index ?? 0}/${t.channel ?? 0} @${fmtBitrate(t.bitrate ?? 500000)}`
+  }
+  if (t.kind === 'can_net') return `→ ${t.host ?? '?'}:${t.port ?? 502} · CH${t.channel ?? 0}`
   return `${t.serial_port ?? 'COM?'} @${t.baud ?? 9600}`
+}
+
+function fmtBitrate(b: number): string {
+  return b >= 1000 ? `${b / 1000}k` : String(b)
 }
 
 /** 连接行悬浮提示：名称 + 传输类型 + 端点（取代行内徽章，避免挤压行） */
@@ -42,6 +71,21 @@ function connTooltip(conn: Connection): string {
   const lines = [conn.name, `${TRANSPORT_LABELS[conn.transport.kind]} · ${transportSummary(conn.transport)}`]
   if (isMasterConn(conn)) {
     lines.push('主机连接：主动连接/轮询远端从机')
+  } else if (isCanConn(conn)) {
+    const periodic = (conn.can_nodes ?? []).reduce(
+      (n, node) => n + node.frames.filter((f) => f.enabled && f.period_ms > 0).length,
+      0,
+    )
+    lines.push(`CAN 连接：直采直控（周期报文 ${periodic} 条）`)
+    const agg = store.canRx[conn.id]
+    if (agg && connRunning(conn.id)) {
+      lines.push(
+        `帧率：发送 ${agg.tx_rate.toFixed(1)} / 接收 ${agg.rx_rate.toFixed(1)} 帧/秒`,
+        `累计：发送 ${agg.tx_total} / 接收 ${agg.rx_total}${agg.err_total ? ` / 错误 ${agg.err_total}` : ''}`,
+      )
+    }
+  }
+  if (isMasterConn(conn) || isCanConn(conn)) {
     const st = store.connStates[conn.id]
     if (st) {
       const label = CONN_STATE_LABELS[st.kind]
@@ -60,11 +104,33 @@ const CONN_STATE_LABELS: Record<string, string> = {
 
 /** 主机连接链路异常徽章（连接中/重连中才显示；已连接不占行内空间） */
 function connStateBadge(conn: Connection): { label: string; title: string } | null {
-  if (!isMasterConn(conn) || !connRunning(conn.id)) return null
+  if ((!isMasterConn(conn) && !isCanConn(conn)) || !connRunning(conn.id)) return null
   const st = store.connStates[conn.id]
   if (!st || st.kind === 'connected') return null
   const label = CONN_STATE_LABELS[st.kind] ?? st.kind
   return { label, title: st.detail ? `${label}：${st.detail}` : label }
+}
+
+/** CAN 节点行悬浮提示：名称 + 报文数（周期发送的单独计数） */
+function nodeTooltip(node: CanNode): string {
+  const periodic = node.frames.filter((f) => f.enabled && f.period_ms > 0).length
+  const lines = [node.name, `${node.frames.length} 条报文（周期发送 ${periodic}）`]
+  const st = store.connStates[connOfId(node.id)?.id ?? -1]
+  if (st && st.kind !== 'connected' && st.detail) lines.push(`链路：${st.detail}`)
+  return lines.join('\n')
+}
+
+/** 节点状态点：连接未运行=灰；连接运行但节点未在线=琥珀；在线=绿（停用即暂停周期发送） */
+function nodeDotClass(node: CanNode): Record<string, boolean> {
+  const conn = connOfId(node.id)
+  if (!conn || !connRunning(conn.id)) return {}
+  if (!deviceRunning(node.id)) return { warn: true }
+  return { on: true }
+}
+
+function selectDevice(id: number) {
+  store.selectedDeviceId = id
+  api.selectDevice(id)
 }
 
 /** 设备行悬浮提示：名称 + 从机地址 + 点数（ID 徽章移入提示） */
@@ -94,22 +160,12 @@ function devHealthy(dev: Device): boolean | null {
 
 /** 设备状态点：连接未运行=灰；连接运行但设备未在线=琥珀；在线=绿（主机采集不健康=红） */
 function devDotClass(dev: Device): Record<string, boolean> {
-  const conn = connOfDevice(dev.id)
+  const conn = connOfId(dev.id)
   if (!conn || !connRunning(conn.id)) return {}
   if (!deviceRunning(dev.id)) return { warn: true }
   const healthy = devHealthy(dev)
   if (healthy === false) return { bad: true }
   return { on: true }
-}
-
-function selectDevice(id: number) {
-  store.selectedDeviceId = id
-  api.selectDevice(id)
-}
-
-/** 找设备所属连接 */
-function connOfDevice(devId: number): Connection | undefined {
-  return (store.project?.connections ?? []).find((c) => c.devices.some((d) => d.id === devId))
 }
 
 // ---------- 单连接 / 单设备启停 ----------
@@ -133,23 +189,24 @@ async function toggleConn(conn: Connection) {
   }
 }
 
-async function toggleDev(dev: Device) {
-  const conn = connOfDevice(dev.id)
+/** 在线启停一台设备或 CAN 节点（共用 id 空间，语义：停用=暂停轮询/周期发送） */
+async function toggleDev(id: number, name: string) {
+  const conn = connOfId(id)
   if (!conn || !store.project || switching.value) return
   switching.value = true
   try {
-    if (deviceRunning(dev.id)) {
-      // 在线停用该设备（连接保持运行，其他设备不受影响）
-      await api.setDeviceEnabled(dev.id, false)
+    if (deviceRunning(id)) {
+      // 在线停用（连接保持运行，其他对象不受影响）
+      await api.setDeviceEnabled(id, false)
     } else if (connRunning(conn.id)) {
-      // 连接已运行：在线启用该设备
-      await api.setDeviceEnabled(dev.id, true)
+      // 连接已运行：在线启用
+      await api.setDeviceEnabled(id, true)
     } else {
-      // 连接未启动：启动连接但仅带起这一台设备（其余设备之后可单独 ▶）
-      await api.startConn(store.project, conn.id, [dev.id])
+      // 连接未启动：启动连接但仅带起这一个对象（其余对象之后可单独 ▶）
+      await api.startConn(store.project, conn.id, [id])
     }
   } catch (e) {
-    await uiAlert(`设备「${dev.name}」操作失败：\n${e instanceof Error ? e.message : String(e)}`)
+    await uiAlert(`「${name}」操作失败：\n${e instanceof Error ? e.message : String(e)}`)
   } finally {
     switching.value = false
   }
@@ -197,19 +254,26 @@ function projMenu(e: MouseEvent) {
 }
 
 function connMenu(e: MouseEvent, conn: Connection) {
-  openMenu(e, conn.name, [
-    { label: '＋ 新建设备', action: () => openDevEditor(conn.id, null) },
+  const items: MenuItem[] = []
+  if (isCanConn(conn)) {
+    items.push({ label: '＋ 新建 CAN 节点', action: () => openNodeEditor(conn.id, null) })
+    items.push({ label: '发送 CAN 帧', action: () => openCanPanel(conn.id) })
+  } else {
+    items.push({ label: '＋ 新建设备', action: () => openDevEditor(conn.id, null) })
+  }
+  items.push(
     { label: connRunning(conn.id) ? '■ 停止连接' : '▶ 启动连接', action: () => toggleConn(conn) },
     { label: '编辑连接', action: () => openConnEditor(conn) },
     { label: '删除连接', action: () => delConn(conn), danger: true },
-  ])
+  )
+  openMenu(e, conn.name, items)
 }
 
 function devMenu(e: MouseEvent, connId: number, dev: Device) {
   const conn = store.project?.connections.find((c) => c.id === connId)
   const items: MenuItem[] = [
     { label: '编辑设备', action: () => openDevEditor(connId, dev) },
-    { label: deviceRunning(dev.id) ? '■ 停止设备' : '▶ 启动设备', action: () => toggleDev(dev) },
+    { label: deviceRunning(dev.id) ? '■ 停止设备' : '▶ 启动设备', action: () => toggleDev(dev.id, dev.name) },
     { label: '复制设备', action: () => duplicateDevice(connId, dev) },
     { label: '删除设备', action: () => delDev(dev), danger: true },
   ]
@@ -217,6 +281,14 @@ function devMenu(e: MouseEvent, connId: number, dev: Device) {
     items.splice(2, 0, { label: '发送测试帧', action: () => openTestPanel(connId, dev.slave_id) })
   }
   openMenu(e, `${dev.name} (ID ${dev.slave_id})`, items)
+}
+
+function nodeMenu(e: MouseEvent, node: CanNode) {
+  openMenu(e, node.name, [
+    { label: '编辑节点', action: () => openNodeEditor(connOfId(node.id)?.id ?? null, node) },
+    { label: deviceRunning(node.id) ? '■ 停止节点' : '▶ 启动节点', action: () => toggleDev(node.id, node.name) },
+    { label: '删除节点', action: () => delNode(node), danger: true },
+  ])
 }
 
 /** 复制设备：同参数新设备，从机地址自动取本连接最大值 +1；连接运行中则重启使其生效 */
@@ -255,6 +327,12 @@ interface ConnEditState {
   baud: number
   parity: Parity
   stopBits: number
+  /** usb_can */
+  canBackend: string
+  deviceIndex: number
+  canChannel: number
+  bitrate: number
+  serialBaud: number
 }
 
 const connEdit = reactive<ConnEditState>({
@@ -269,6 +347,11 @@ const connEdit = reactive<ConnEditState>({
   baud: 9600,
   parity: 'none',
   stopBits: 1,
+  canBackend: 'slcan',
+  deviceIndex: 0,
+  canChannel: 0,
+  bitrate: 500000,
+  serialBaud: 115200,
 })
 
 const connEditorOpen = ref(false)
@@ -282,8 +365,9 @@ const connTest = reactive<{ busy: boolean; result: TestConnResult | null }>({
 
 /** 检测按钮语义随传输方式变化：TCP 主机=测试连接；从机=检查端口；串口=检查串口占用 */
 const connTestLabel = computed(() => {
-  if (connEdit.kind === 'tcp_client') return '测试连接'
+  if (connEdit.kind === 'tcp_client' || connEdit.kind === 'can_net') return '测试连接'
   if (connEdit.kind === 'tcp_server') return '检查端口'
+  if (connEdit.kind === 'usb_can' && connEdit.canBackend !== 'slcan') return '检测后端'
   return '检查串口'
 })
 
@@ -311,6 +395,19 @@ function openConnEditor(c: Connection | null) {
       connEdit.host = c.transport.host ?? '127.0.0.1'
       connEdit.port = c.transport.port ?? 502
       connEdit.timeoutMs = c.transport.timeout_ms ?? 1000
+    } else if (c.transport.kind === 'usb_can') {
+      const t = c.transport
+      connEdit.canBackend = t.backend ?? 'slcan'
+      connEdit.deviceIndex = t.device_index ?? 0
+      connEdit.canChannel = t.channel ?? 0
+      connEdit.bitrate = t.bitrate ?? 500000
+      connEdit.serialPort = t.serial_port ?? 'COM3'
+      connEdit.serialBaud = t.serial_baud ?? 115200
+    } else if (c.transport.kind === 'can_net') {
+      connEdit.host = c.transport.host ?? '127.0.0.1'
+      connEdit.port = c.transport.port ?? 502
+      connEdit.timeoutMs = c.transport.timeout_ms ?? 1000
+      connEdit.canChannel = c.transport.channel ?? 0
     } else {
       // serial / serial_master 共用串口字段；serial_master 另有超时
       connEdit.serialPort = c.transport.serial_port ?? 'COM3'
@@ -333,6 +430,11 @@ function openConnEditor(c: Connection | null) {
     connEdit.baud = 9600
     connEdit.parity = 'none'
     connEdit.stopBits = 1
+    connEdit.canBackend = 'slcan'
+    connEdit.deviceIndex = 0
+    connEdit.canChannel = 0
+    connEdit.bitrate = 500000
+    connEdit.serialBaud = 115200
   }
   connTest.result = null
   connEditorOpen.value = true
@@ -363,6 +465,27 @@ function applyTransport(): Transport {
       timeout_ms: Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
     }
   }
+  if (connEdit.kind === 'usb_can') {
+    return {
+      kind: 'usb_can',
+      backend: connEdit.canBackend,
+      device_index: Math.max(0, Math.round(connEdit.deviceIndex) || 0),
+      channel: Math.min(1, Math.max(0, Math.round(connEdit.canChannel) || 0)),
+      bitrate: connEdit.bitrate,
+      // 仅 slcan 后端用串口；其余后端不落盘（Rust 端为 Option）
+      ...(connEdit.canBackend === 'slcan' ? { serial_port: connEdit.serialPort.trim() || 'COM3' } : {}),
+      serial_baud: connEdit.serialBaud,
+    }
+  }
+  if (connEdit.kind === 'can_net') {
+    return {
+      kind: 'can_net',
+      host: connEdit.host.trim() || '127.0.0.1',
+      port: Math.max(1, Math.min(65535, Math.round(connEdit.port) || 502)),
+      channel: Math.min(1, Math.max(0, Math.round(connEdit.canChannel) || 0)),
+      timeout_ms: Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
+    }
+  }
   if (connEdit.kind === 'serial_master') {
     return {
       kind: 'serial_master',
@@ -389,7 +512,7 @@ async function saveConnEditor() {
   if (editId != null) {
     patchConnection(editId, base)
   } else {
-    addConnection({ id: nextConnId(), devices: [], ...base })
+    addConnection({ id: nextConnId(), devices: [], can_nodes: [], ...base })
   }
   connEditorOpen.value = false
   // 运行中的连接改了传输参数：重启该连接让新配置生效（新建的连接不自动启动）
@@ -512,8 +635,67 @@ async function saveDevEditor() {
 
 async function delDev(dev: Device) {
   if (!(await uiConfirm(`删除设备「${dev.name}」（含 ${dev.points.length} 个点位）？`, '删除设备'))) return
-  const conn = connOfDevice(dev.id)
+  const conn = connOfId(dev.id)
   removeDevice(dev.id)
+  if (conn) await restartConnIfRunning(conn.id)
+}
+
+// ---------- CAN 节点编辑 ----------
+
+const nodeEdit = reactive<{ connId: number | null; id: number | null; name: string; enabled: boolean }>({
+  connId: null,
+  id: null,
+  name: '',
+  enabled: true,
+})
+
+const nodeEditorOpen = ref(false)
+
+function openNodeEditor(connId: number | null, n: CanNode | null) {
+  nodeEdit.connId = connId
+  if (n) {
+    nodeEdit.id = n.id
+    nodeEdit.name = n.name
+    nodeEdit.enabled = n.enabled
+  } else {
+    nodeEdit.id = null
+    nodeEdit.name = '新 CAN 节点'
+    nodeEdit.enabled = true
+  }
+  nodeEditorOpen.value = true
+}
+
+async function saveNodeEditor() {
+  const connId = nodeEdit.connId
+  if (connId == null || !store.project) return
+  const base = { name: nodeEdit.name.trim() || '未命名节点', enabled: nodeEdit.enabled }
+  let savedId: number
+  if (nodeEdit.id != null) {
+    savedId = nodeEdit.id
+    patchCanNode(savedId, base)
+  } else {
+    const node: CanNode = { id: nextNodeId(), frames: [], ...base }
+    savedId = node.id
+    addCanNode(connId, node)
+    selectDevice(node.id)
+  }
+  nodeEditorOpen.value = false
+  // 启用状态是运行时快照：重启所属连接生效（保留当前在线对象，本节点按勾选决定）
+  if (connRunning(connId)) {
+    const keep = runningDevicesOfConn(connId)
+    const i = keep.indexOf(savedId)
+    if (nodeEdit.enabled && i < 0) keep.push(savedId)
+    if (!nodeEdit.enabled && i >= 0) keep.splice(i, 1)
+    await restartConnIfRunning(connId, keep)
+  }
+}
+
+async function delNode(node: CanNode) {
+  const n = node.frames.length
+  const msg = n > 0 ? `删除节点「${node.name}」（含 ${n} 条报文）？` : `删除节点「${node.name}」？`
+  if (!(await uiConfirm(msg, '删除节点'))) return
+  const conn = connOfId(node.id)
+  removeCanNode(node.id)
   if (conn) await restartConnIfRunning(conn.id)
 }
 
@@ -539,6 +721,8 @@ const parityOptions: Array<{ label: string; value: Parity }> = [
   { label: '奇校验', value: 'odd' },
 ]
 const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
+/** slcan 串口侧波特率（与 CAN 波特率独立；适配器固件常为 115200） */
+const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 </script>
 
 <template>
@@ -560,7 +744,7 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
 
         <div v-for="conn in project.connections" :key="conn.id" class="group">
           <div class="node conn-node" :title="connTooltip(conn)" @contextmenu="connMenu($event, conn)">
-            <span class="icon">{{ isMasterConn(conn) ? '🔌' : '🔀' }}</span>
+            <span class="icon">{{ isCanConn(conn) ? '📡' : isMasterConn(conn) ? '🔌' : '🔀' }}</span>
             <span class="label">{{ conn.name }}</span>
             <span
               v-if="connStateBadge(conn)"
@@ -596,14 +780,37 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
               :class="{ on: deviceRunning(dev.id) }"
               :disabled="switching"
               :title="deviceRunning(dev.id) ? '停用该设备（连接保持运行）' : '启动该设备（连接未运行时一并启动，且只带起这一台）'"
-              @click.stop="toggleDev(dev)"
+              @click.stop="toggleDev(dev.id, dev.name)"
             >
               {{ deviceRunning(dev.id) ? '■' : '▶' }}
             </button>
           </div>
 
-          <div v-if="conn.devices.length === 0" class="dev-empty" @contextmenu="connMenu($event, conn)">
-            <span>无设备（右键新建）</span>
+          <div
+            v-for="node in conn.can_nodes ?? []"
+            :key="node.id"
+            class="node dev-node"
+            :class="{ selected: node.id === store.selectedDeviceId }"
+            :title="nodeTooltip(node)"
+            @click="selectDevice(node.id)"
+            @contextmenu="nodeMenu($event, node)"
+          >
+            <span class="dot" :class="nodeDotClass(node)" />
+            <span class="label">{{ node.name }}</span>
+            <span class="count">{{ node.frames.length }} 帧</span>
+            <button
+              class="node-btn"
+              :class="{ on: deviceRunning(node.id) }"
+              :disabled="switching"
+              :title="deviceRunning(node.id) ? '停用该节点（暂停其周期报文发送）' : '启动该节点（连接未运行时一并启动，且只带起这一个）'"
+              @click.stop="toggleDev(node.id, node.name)"
+            >
+              {{ deviceRunning(node.id) ? '■' : '▶' }}
+            </button>
+          </div>
+
+          <div v-if="conn.devices.length === 0 && (conn.can_nodes ?? []).length === 0" class="dev-empty" @contextmenu="connMenu($event, conn)">
+            <span>{{ isCanConn(conn) ? '无 CAN 节点（右键新建）' : '无设备（右键新建）' }}</span>
           </div>
         </div>
 
@@ -646,6 +853,8 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
           <option value="tcp_client">{{ TRANSPORT_LABELS['tcp_client'] }}</option>
           <option value="serial">{{ TRANSPORT_LABELS['serial'] }}</option>
           <option value="serial_master">{{ TRANSPORT_LABELS['serial_master'] }}</option>
+          <option value="usb_can">{{ TRANSPORT_LABELS['usb_can'] }}</option>
+          <option value="can_net">{{ TRANSPORT_LABELS['can_net'] }}（M3 未实现）</option>
         </select>
       </label>
 
@@ -675,6 +884,67 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
           <span class="tip-inline">请求超时+重试2次；断线自动重连</span>
         </div>
         <p class="tip">主机连接：主动连接远端从机并按设备点表轮询采集。保存前可「测试连接」验证远端可达。</p>
+      </div>
+
+      <div v-else-if="connEdit.kind === 'usb_can'" class="f-group">
+        <label class="f-row">
+          <span class="f-lab">后端</span>
+          <select v-model="connEdit.canBackend">
+            <option value="slcan">{{ CAN_BACKEND_LABELS.slcan }}</option>
+            <option disabled value="zlgcan">{{ CAN_BACKEND_LABELS.zlgcan }}</option>
+            <option disabled value="candle">{{ CAN_BACKEND_LABELS.candle }}</option>
+          </select>
+        </label>
+        <div class="f-row">
+          <span class="f-lab">CAN 波特率</span>
+          <select v-model.number="connEdit.bitrate">
+            <option v-for="b in CAN_BITRATES" :key="b" :value="b">{{ b >= 1000 ? b / 1000 + 'k' : b }}</option>
+          </select>
+          <span class="f-lab f-lab2" title="双通道 USB-CAN 设备的通道号；slcan 单通道设备忽略">通道</span>
+          <select v-model.number="connEdit.canChannel">
+            <option :value="0">0</option>
+            <option :value="1">1</option>
+          </select>
+        </div>
+        <div v-if="connEdit.canBackend !== 'slcan'" class="f-row">
+          <span class="f-lab" title="zlgcan 的设备号（VCI_OpenDevice 用）；candle 为通道路径序号">设备序号</span>
+          <input v-model.number="connEdit.deviceIndex" type="number" min="0" class="mono" />
+          <span class="tip-inline">该后端未实现（等硬件到货）</span>
+        </div>
+        <template v-else>
+          <div class="f-row">
+            <span class="f-lab">串口</span>
+            <input v-model="connEdit.serialPort" list="serial-ports" placeholder="COM5" class="mono" />
+            <button class="mini" title="重新枚举本机串口" @click="refreshSerialPorts">枚举</button>
+          </div>
+          <div class="f-row">
+            <span class="f-lab">串口波特率</span>
+            <select v-model.number="connEdit.serialBaud">
+              <option v-for="b in serialBaudOptions" :key="b" :value="b">{{ b }}</option>
+            </select>
+            <span class="tip-inline">适配器固件常为 115200</span>
+          </div>
+        </template>
+        <p class="tip">CAN 直采直控：被动监听全量报文 + 节点周期报文/手动单帧发送。slcan 设备（CANable 等）即插即用；CANalyst-II 等 zlgcan 设备待 M2。保存前可「检查串口」确认未被占用。</p>
+      </div>
+
+      <div v-else-if="connEdit.kind === 'can_net'" class="f-group">
+        <div class="f-row">
+          <span class="f-lab">网关地址</span>
+          <input v-model="connEdit.host" placeholder="192.168.1.100" class="mono" />
+          <span class="f-lab f-lab2">端口</span>
+          <input v-model.number="connEdit.port" type="number" min="1" max="65535" class="mono" style="flex: 0.6" />
+        </div>
+        <div class="f-row">
+          <span class="f-lab">CAN 通道</span>
+          <select v-model.number="connEdit.canChannel">
+            <option :value="0">0</option>
+            <option :value="1">1</option>
+          </select>
+          <span class="f-lab f-lab2">超时(ms)</span>
+          <input v-model.number="connEdit.timeoutMs" type="number" min="50" step="50" class="mono" />
+        </div>
+        <p class="tip">CAN 转以太网（ZLG CANET-2E 网关，TCP 透传）：尚未实现（M3，等网关到货），连接暂不能启动；「测试连接」可先验证网关可达。</p>
       </div>
 
       <div v-else class="f-group">
@@ -774,6 +1044,24 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
         <span v-if="devEdit.connId != null && connRunning(devEdit.connId)" class="f-hint">该连接运行中，保存后自动重启生效</span>
         <button @click="devEditorOpen = false">取消</button>
         <button class="primary" @click="saveDevEditor">保存</button>
+      </template>
+    </DrawerShell>
+    <!-- CAN 节点编辑抽屉 -->
+    <DrawerShell v-if="nodeEditorOpen" :title="nodeEdit.id != null ? '编辑 CAN 节点' : '新建 CAN 节点'" @close="nodeEditorOpen = false">
+      <label class="f-row">
+        <span class="f-lab">名称</span>
+        <input v-model="nodeEdit.name" placeholder="节点名称（如 1号测控装置）" />
+      </label>
+      <div class="f-row">
+        <span class="f-lab" title="勾选=连接整体启动时默认参与；运行期间以节点行的 ▶/■ 为准（停用=暂停周期报文发送）">启用</span>
+        <input v-model="nodeEdit.enabled" type="checkbox" class="chk" />
+      </div>
+      <p class="tip">节点 = 一组周期发送报文；选中节点后在中栏「发送报文表」里增删改。接收侧报文自动进监视器与 ID 聚合视图，无需配置。</p>
+
+      <template #footer>
+        <span v-if="nodeEdit.connId != null && connRunning(nodeEdit.connId)" class="f-hint">该连接运行中，保存后自动重启生效</span>
+        <button @click="nodeEditorOpen = false">取消</button>
+        <button class="primary" @click="saveNodeEditor">保存</button>
       </template>
     </DrawerShell>
   </div>

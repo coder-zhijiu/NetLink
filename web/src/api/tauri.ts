@@ -69,6 +69,10 @@ export function createTauriApi(): NetLinkApi {
     async sendTestFrame(connId, unit, hex) {
       return await invoke<string>('send_test_frame', { connId, unit, hex })
     },
+    async sendCanFrame(connId, frame) {
+      // 帧结构字段与 Rust 端 CanFrame（snake_case）对齐，参数名走 camelCase
+      await invoke('send_can_frame', { connId, frame })
+    },
     async readPointSheet() {
       const path = await openFileDialog({
         title: '导入点表',

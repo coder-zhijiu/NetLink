@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::model::{Area, Connection, DataType, Device, FaultConfig, ProjectSpec, Transport, ValueSource};
 use crate::protocol::FrameEvent;
+use crate::protocol::can::{CanAgg, CanAggSnapshot, CanMsg, CanNodeRuntime};
 use crate::protocol::modbus::master::{self, MasterMsg};
 use crate::sim;
 
@@ -500,10 +501,16 @@ pub fn now_ms() -> u64 {
 /// 一条连接（总线）的任务组
 struct ConnState {
     devices: Vec<Arc<Mutex<DeviceRuntime>>>,
+    /// CAN 连接的节点运行时（Modbus 连接为空）
+    can_nodes: Vec<Arc<Mutex<CanNodeRuntime>>>,
     cancel: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// 主机连接的命令通道（写点/测试帧）；从机连接为 None
     cmd_tx: Option<mpsc::Sender<MasterMsg>>,
+    /// CAN 连接的命令通道（手动发送）；非 CAN 连接为 None
+    can_cmd_tx: Option<mpsc::Sender<CanMsg>>,
+    /// CAN 连接的观测聚合（接收统计/帧率）；非 CAN 连接为 None
+    can_agg: Option<Arc<Mutex<CanAgg>>>,
 }
 
 /// 主机连接的链路状态（仅主机类连接维护；从机监听不适用）
@@ -625,12 +632,26 @@ impl RuntimeManager {
             })
             .collect();
 
+        // CAN 节点运行时（CAN 连接专用；Modbus 连接恒为空）
+        let can_nodes: Vec<Arc<Mutex<CanNodeRuntime>>> = conn
+            .can_nodes
+            .iter()
+            .map(|n| {
+                let mut rt = CanNodeRuntime::new(n);
+                if let Some(ids) = &enabled_devices {
+                    rt.enabled = ids.contains(&n.id);
+                }
+                Arc::new(Mutex::new(rt))
+            })
+            .collect();
+
         let cancel = CancellationToken::new();
 
         // 仿真 tick 只服务从机连接（波形求值并重建块缓存）；
-        // 主机连接的值来自采集导入（import_registers），tick 会把采集值打回静态占位值，必须跳过
+        // 主机连接的值来自采集导入（import_registers），tick 会把采集值打回静态占位值，必须跳过；
+        // CAN 连接无「实时值」概念（发送报文表读工程配置），同样跳过
         let mut tasks = Vec::new();
-        if !matches!(conn.transport, Transport::TcpClient { .. } | Transport::SerialMaster { .. }) {
+        if matches!(conn.transport, Transport::TcpServer { .. } | Transport::Serial { .. }) {
             let tick_devs = devices.clone();
             let tick_clock = self.inner.clock.clone();
             let tick_cancel = cancel.clone();
@@ -653,6 +674,8 @@ impl RuntimeManager {
             }));
         }
         let mut cmd_tx: Option<mpsc::Sender<MasterMsg>> = None;
+        let mut can_cmd_tx: Option<mpsc::Sender<CanMsg>> = None;
+        let mut can_agg: Option<Arc<Mutex<CanAgg>>> = None;
 
         match &conn.transport {
             Transport::TcpServer { listen_addr, port } => {
@@ -716,15 +739,51 @@ impl RuntimeManager {
                 let t = master::serve_serial(Arc::new(ctx), port, *timeout_ms, cancel.clone(), rx);
                 tasks.push(tokio::spawn(t));
             }
+            Transport::UsbCan { backend, device_index: _, channel: _, bitrate, serial_port, serial_baud } => {
+                if backend != "slcan" {
+                    return Err(format!(
+                        "CAN 后端「{backend}」尚未实现（zlgcan/candle 待硬件到货，当前可用：slcan）"
+                    ));
+                }
+                let name = serial_port.as_deref().unwrap_or("");
+                if name.is_empty() {
+                    return Err("slcan 后端需要配置串口（连接编辑器里选择）".to_string());
+                }
+                // 帧定义预校验：启动即暴露配置错误，而不是发送时静默失败
+                for n in &conn.can_nodes {
+                    for f in &n.frames {
+                        f.validate().map_err(|e| format!("节点「{}」报文 id {}: {e}", n.name, f.id))?;
+                    }
+                }
+                let io = crate::protocol::can::slcan::open(name, *serial_baud, *bitrate)?;
+                let (tx, rx) = mpsc::channel(64);
+                can_cmd_tx = Some(tx);
+                let agg = Arc::new(Mutex::new(CanAgg::default()));
+                can_agg = Some(agg.clone());
+                let ctx = Arc::new(crate::protocol::can::CanCtx {
+                    conn_id: conn.id,
+                    nodes: can_nodes.clone(),
+                    manager: self.clone(),
+                    agg,
+                });
+                let t = crate::protocol::can::serve_can_with(ctx, Box::new(io), cancel.clone(), rx);
+                tasks.push(tokio::spawn(t));
+            }
+            Transport::CanNet { .. } => {
+                return Err("CAN 转以太网（ZLG CANET）尚未实现：等 CANET-2E 到货后启用（M3）".to_string());
+            }
         }
 
         self.inner.conns.lock().unwrap().insert(
             conn.id,
             ConnState {
                 devices,
+                can_nodes,
                 cancel,
                 tasks,
                 cmd_tx,
+                can_cmd_tx,
+                can_agg,
             },
         );
         Ok(())
@@ -757,7 +816,7 @@ impl RuntimeManager {
         self.inner.conns.lock().unwrap().keys().copied().collect()
     }
 
-    /// 在线（运行中）的设备 id 列表（前端逐设备启停显示用）
+    /// 在线（运行中）的设备 id 列表（前端逐设备启停显示用；CAN 节点共用同一 id 空间）
     pub fn running_device_ids(&self) -> Vec<u64> {
         let conns = self.inner.conns.lock().unwrap();
         let mut out = Vec::new();
@@ -768,12 +827,19 @@ impl RuntimeManager {
                     out.push(d.id);
                 }
             }
+            for node in &state.can_nodes {
+                let n = node.lock().unwrap();
+                if n.enabled {
+                    out.push(n.id);
+                }
+            }
         }
         out
     }
 
-    /// 在线启停一台设备（不改工程配置）：
-    /// 从机侧停用后该从机地址不再应答（按网关惯例回 0x0B）；主机侧停用即暂停轮询
+    /// 在线启停一台设备/CAN 节点（不改工程配置）：
+    /// 从机侧停用后该从机地址不再应答（按网关惯例回 0x0B）；主机侧停用即暂停轮询；
+    /// CAN 节点停用即暂停其周期报文发送
     pub fn set_device_enabled(&self, device_id: u64, enabled: bool) -> Result<(), String> {
         let conns = self.inner.conns.lock().unwrap();
         for state in conns.values() {
@@ -781,6 +847,13 @@ impl RuntimeManager {
                 let mut d = dev.lock().unwrap();
                 if d.id == device_id {
                     d.enabled = enabled;
+                    return Ok(());
+                }
+            }
+            for node in &state.can_nodes {
+                let mut n = node.lock().unwrap();
+                if n.id == device_id {
+                    n.enabled = enabled;
                     return Ok(());
                 }
             }
@@ -833,6 +906,35 @@ impl RuntimeManager {
             .iter()
             .map(|(id, s)| (*id, s.kind, s.detail.clone()))
             .collect()
+    }
+
+    /// CAN 连接的观测快照（接收聚合 + 帧率）；推送 ID 聚合视图与徽章用
+    pub fn snapshot_can_rx(&self) -> Vec<(u64, CanAggSnapshot)> {
+        let conns = self.inner.conns.lock().unwrap();
+        conns
+            .iter()
+            .filter_map(|(id, state)| {
+                let agg = state.can_agg.as_ref()?;
+                Some((*id, agg.lock().unwrap().snapshot()))
+            })
+            .collect()
+    }
+
+    /// CAN 手动发送一帧（下发到所属 CAN 连接的调度线程）
+    pub async fn send_can_frame(&self, conn_id: u64, frame: crate::protocol::can::CanFrame) -> Result<(), String> {
+        let tx = {
+            let conns = self.inner.conns.lock().unwrap();
+            match conns.get(&conn_id) {
+                Some(state) => state.can_cmd_tx.clone(),
+                None => return Err("连接不存在或未启动".to_string()),
+            }
+        };
+        let tx = tx.ok_or("该连接不是 CAN 连接")?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(CanMsg::SendFrame { frame, reply: reply_tx })
+            .await
+            .map_err(|_| "CAN 连接已停止".to_string())?;
+        reply_rx.await.map_err(|_| "发送命令无应答".to_string())?
     }
 
     /// 主机侧写点位：按点位类型自动拼 FC05/06/10 下发到所属主机连接

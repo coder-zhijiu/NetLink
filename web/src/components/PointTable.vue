@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { store, selectedDevice, selectedConnection, isSelectedMaster, addPoint, removePoint, patchPoint, nextPointId, restartConnIfRunning, importPoints, exportRowsOfDevice } from '../store'
+import { store, selectedDevice, selectedCanNode, selectedConnection, isSelectedMaster, addPoint, removePoint, patchPoint, nextPointId, restartConnIfRunning, importPoints, exportRowsOfDevice } from '../store'
 import type { ImportMode, ImportOutcome } from '../store'
 import { api } from '../api'
 import { uiAlert } from '../ui-dialog'
@@ -22,8 +22,10 @@ import {
   type ValueSource,
 } from '../types'
 import DrawerShell from './DrawerShell.vue'
+import CanFrameTable from './CanFrameTable.vue'
 
 const device = selectedDevice
+const canNode = selectedCanNode
 const isMaster = isSelectedMaster
 
 /** 选中设备所属连接是否在运行（逐连接启停） */
@@ -313,6 +315,10 @@ async function onExport() {
 
 <template>
   <div class="panel">
+    <!-- CAN 节点：发送报文表（设备/点表概念对 CAN 无意义，切换面板形态） -->
+    <CanFrameTable v-if="canNode" />
+
+    <template v-else>
     <div class="panel-head">
       <span class="panel-title">点表</span>
       <template v-if="device">
@@ -518,6 +524,7 @@ async function onExport() {
         </button>
       </template>
     </DrawerShell>
+    </template>
   </div>
 </template>
 

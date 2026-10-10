@@ -24,6 +24,7 @@ fn test_project(port: u16, fault: FaultConfig) -> ProjectSpec {
                 listen_addr: "127.0.0.1".into(),
                 port,
             },
+            can_nodes: vec![],
             devices: vec![Device {
                 id: 1,
                 name: "测试装置".into(),

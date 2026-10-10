@@ -1,8 +1,8 @@
 import { computed, reactive } from 'vue'
 import { api } from './api'
 import { uiAlert, uiConfirm } from './ui-dialog'
-import { isMasterTransport } from './types'
-import type { Connection, ConnState, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec } from './types'
+import { isCanTransport, isMasterTransport } from './types'
+import type { CanAgg, CanNode, CanPeriodicFrame, Connection, ConnState, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec } from './types'
 import type { RuntimePatch } from './api/contract'
 
 const FRAME_LIMIT = 5000
@@ -20,11 +20,13 @@ export const store = reactive({
   stats: {} as Record<number, DevStat>,
   /** 主机连接链路状态（conn_id → 状态；替换式，连接停止后消失） */
   connStates: {} as Record<number, ConnState>,
+  /** CAN 连接观测（conn_id → 聚合/帧率；替换式，连接停止后消失） */
+  canRx: {} as Record<number, CanAgg>,
   paused: false,
   running: false,
   /** 逐连接运行状态（元素为运行中的连接 id） */
   runningConns: [] as number[],
-  /** 在线设备 id 列表（运行态，与工程配置的 enabled 解耦） */
+  /** 在线设备/CAN 节点 id 列表（运行态，与工程配置的 enabled 解耦） */
   runningDevices: [] as number[],
   apiKind: 'mock' as 'mock' | 'tauri',
   /** 测试帧面板 */
@@ -32,6 +34,11 @@ export const store = reactive({
     open: false,
     connId: null as number | null,
     unit: null as number | null,
+  },
+  /** CAN 发送面板（手动单帧直控） */
+  canPanel: {
+    open: false,
+    connId: null as number | null,
   },
 })
 
@@ -61,12 +68,22 @@ export function applyProjectHandle(h: ProjectHandle) {
   store.values = {}
   store.stats = {}
   store.connStates = {}
+  store.canRx = {}
   store.running = false
   store.runningConns = []
   store.runningDevices = []
   store.paused = false
-  store.selectedDeviceId = h.spec.connections.flatMap((c) => c.devices)[0]?.id ?? null
+  store.selectedDeviceId = firstSelectableId(h.spec)
   if (store.selectedDeviceId != null) api.selectDevice(store.selectedDeviceId)
+}
+
+/** 工程里第一个可选中对象（设备或 CAN 节点；id 全局唯一） */
+function firstSelectableId(p: ProjectSpec): number | null {
+  for (const c of p.connections) {
+    const dev = c.devices[0]?.id ?? c.can_nodes?.[0]?.id
+    if (dev != null) return dev
+  }
+  return null
 }
 
 /** 刷新工程目录列表（失败不阻塞：列表为空仍可编辑当前工程） */
@@ -143,6 +160,7 @@ export function applyUpdate(patch: RuntimePatch) {
   if (patch.running_conns) store.runningConns = patch.running_conns
   if (patch.running_devices) store.runningDevices = patch.running_devices
   if (patch.conn_states) store.connStates = patch.conn_states
+  if (patch.can_rx) store.canRx = patch.can_rx
   if (patch.paused !== undefined) store.paused = patch.paused
 }
 
@@ -151,18 +169,27 @@ export function connRunning(connId: number): boolean {
   return store.runningConns.includes(connId)
 }
 
-/** 设备是否在线运行（连接在运行且设备在 runningDevices 里） */
+/** 设备/CAN 节点是否在线运行（连接在运行且在 runningDevices 里；两者共用 id 空间） */
 export function deviceRunning(deviceId: number): boolean {
   if (!store.runningDevices.includes(deviceId)) return false
-  const conn = (store.project?.connections ?? []).find((c) => c.devices.some((d) => d.id === deviceId))
+  const conn = connOfId(deviceId)
   return !!conn && connRunning(conn.id)
 }
 
-/** 某连接当前在线的设备 id（编辑后重启连接时保留原运行面用） */
+/** 设备或 CAN 节点所属连接 */
+export function connOfId(id: number): Connection | null {
+  for (const conn of store.project?.connections ?? []) {
+    if (conn.devices.some((d) => d.id === id) || (conn.can_nodes ?? []).some((n) => n.id === id)) return conn
+  }
+  return null
+}
+
+/** 某连接当前在线的对象 id（设备 + CAN 节点；编辑后重启连接时保留原运行面用） */
 export function runningDevicesOfConn(connId: number): number[] {
   const conn = store.project?.connections.find((c) => c.id === connId)
   if (!conn) return []
-  return conn.devices.map((d) => d.id).filter((id) => store.runningDevices.includes(id))
+  const ids = [...conn.devices.map((d) => d.id), ...(conn.can_nodes ?? []).map((n) => n.id)]
+  return ids.filter((id) => store.runningDevices.includes(id))
 }
 
 /** 运行中的连接被结构性修改（编辑/增删设备点位）后：重启该连接让改动生效。
@@ -197,13 +224,22 @@ export const selectedDevice = computed<Device | null>(() => {
   return null
 })
 
-/** 选中设备所属连接 */
-export const selectedConnection = computed(() => {
+/** 当前选中的 CAN 节点（与设备共用 selectedDeviceId / id 空间） */
+export const selectedCanNode = computed<CanNode | null>(() => {
   const id = store.selectedDeviceId
+  if (id == null) return null
   for (const conn of store.project?.connections ?? []) {
-    if (conn.devices.some((d) => d.id === id)) return conn
+    const node = (conn.can_nodes ?? []).find((n) => n.id === id)
+    if (node) return node
   }
   return null
+})
+
+/** 选中对象（设备或节点）所属连接 */
+export const selectedConnection = computed(() => {
+  const id = store.selectedDeviceId
+  if (id == null) return null
+  return connOfId(id)
 })
 
 /** 选中设备是否属于主机连接（决定点表交互模式） */
@@ -212,11 +248,23 @@ export const isSelectedMaster = computed(() => {
   return kind != null && isMasterTransport(kind)
 })
 
+/** 选中对象是否属于 CAN 连接（决定发送报文表/聚合视图形态） */
+export const isSelectedCan = computed(() => {
+  const kind = selectedConnection.value?.transport.kind
+  return kind != null && isCanTransport(kind)
+})
+
 /** 打开测试帧面板（可预填目标连接与从机地址） */
 export function openTestPanel(connId?: number, unit?: number) {
   if (connId != null) store.testPanel.connId = connId
   if (unit != null) store.testPanel.unit = unit
   store.testPanel.open = true
+}
+
+/** 打开 CAN 发送面板（可预填目标连接） */
+export function openCanPanel(connId?: number) {
+  if (connId != null) store.canPanel.connId = connId
+  store.canPanel.open = true
 }
 
 /** 点位编辑后的写回（直接改 store 内对象，Vue 响应式生效） */
@@ -312,13 +360,16 @@ export function patchConnection(id: number, changes: Partial<Omit<Connection, 'i
 export function removeConnection(id: number) {
   const p = store.project
   if (!p) return
-  // 删掉的连接里可能包含当前选中设备，选中回退到首个可用设备
+  // 删掉的连接里可能包含当前选中对象，选中回退到首个可用对象
   const removed = p.connections.find((c) => c.id === id)
-  const selectedInRemoved = removed?.devices.some((d) => d.id === store.selectedDeviceId) ?? false
+  const selectedInRemoved =
+    removed?.devices.some((d) => d.id === store.selectedDeviceId) ||
+    (removed?.can_nodes ?? []).some((n) => n.id === store.selectedDeviceId) ||
+    false
   const idx = p.connections.findIndex((c) => c.id === id)
   if (idx >= 0) p.connections.splice(idx, 1)
   if (selectedInRemoved) {
-    store.selectedDeviceId = p.connections.flatMap((c) => c.devices)[0]?.id ?? null
+    store.selectedDeviceId = firstSelectableId(p)
   }
 }
 
@@ -337,9 +388,69 @@ export function removeDevice(deviceId: number) {
     if (idx >= 0) {
       conn.devices.splice(idx, 1)
       if (store.selectedDeviceId === deviceId) {
-        store.selectedDeviceId = allDevices()[0]?.id ?? null
+        store.selectedDeviceId = allDevices()[0]?.id ?? firstSelectableId(store.project!) ?? null
       }
       return
     }
   }
+}
+
+// ---------- CAN 节点 / 周期报文 CRUD ----------
+
+let nodeSeq = 300000
+export function nextNodeId() {
+  return nodeSeq++
+}
+
+let frameSeq = 400000
+export function nextFrameId() {
+  return frameSeq++
+}
+
+export function addCanNode(connId: number, node: CanNode) {
+  const conn = store.project?.connections.find((c) => c.id === connId)
+  if (!conn) return
+  conn.can_nodes ??= []
+  conn.can_nodes.push(node)
+}
+
+export function patchCanNode(nodeId: number, changes: Partial<Omit<CanNode, 'id' | 'frames'>>) {
+  const node = allCanNodes().find((n) => n.id === nodeId)
+  if (node) Object.assign(node, changes)
+}
+
+export function removeCanNode(nodeId: number) {
+  for (const conn of store.project?.connections ?? []) {
+    const nodes = conn.can_nodes ?? []
+    const idx = nodes.findIndex((n) => n.id === nodeId)
+    if (idx >= 0) {
+      nodes.splice(idx, 1)
+      if (store.selectedDeviceId === nodeId) {
+        store.selectedDeviceId = firstSelectableId(store.project!)
+      }
+      return
+    }
+  }
+}
+
+export function addFrame(nodeId: number, frame: CanPeriodicFrame) {
+  allCanNodes().find((n) => n.id === nodeId)?.frames.push(frame)
+}
+
+export function patchFrame(nodeId: number, frameId: number, changes: Partial<Omit<CanPeriodicFrame, 'id'>>) {
+  const node = allCanNodes().find((n) => n.id === nodeId)
+  const fr = node?.frames.find((f) => f.id === frameId)
+  if (fr) Object.assign(fr, changes)
+}
+
+export function removeFrame(nodeId: number, frameId: number) {
+  const node = allCanNodes().find((n) => n.id === nodeId)
+  if (!node) return
+  const idx = node.frames.findIndex((f) => f.id === frameId)
+  if (idx >= 0) node.frames.splice(idx, 1)
+}
+
+/** 全部连接的扁平 CAN 节点列表 */
+export function allCanNodes(): CanNode[] {
+  return (store.project?.connections ?? []).flatMap((c) => c.can_nodes ?? [])
 }

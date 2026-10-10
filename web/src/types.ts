@@ -4,13 +4,30 @@ export type Area = 'coil' | 'discrete_input' | 'holding_register' | 'input_regis
 export type DataType = 'u16' | 'i16' | 'u32' | 'i32' | 'f32' | 'u64' | 'i64' | 'f64'
 export type SourceKind = 'static' | 'sine' | 'ramp' | 'random_walk' | 'swing'
 export type FaultKind = 'normal' | 'timeout' | 'delay' | 'exception' | 'corrupt' | 'disconnect'
-export type TransportKind = 'tcp_server' | 'serial' | 'tcp_client' | 'serial_master'
+export type TransportKind = 'tcp_server' | 'serial' | 'tcp_client' | 'serial_master' | 'usb_can' | 'can_net'
 export type Parity = 'none' | 'even' | 'odd'
+/** USB-CAN 直采后端（v1 已实现 slcan；zlgcan/candle 待硬件到货） */
+export type CanBackend = 'slcan' | 'zlgcan' | 'candle'
 
 /** 主机类传输（主动发起轮询/连接的角色） */
 export function isMasterTransport(kind: TransportKind): boolean {
   return kind === 'tcp_client' || kind === 'serial_master'
 }
+
+/** CAN 类传输（直采直控 / 转以太网） */
+export function isCanTransport(kind: TransportKind): boolean {
+  return kind === 'usb_can' || kind === 'can_net'
+}
+
+/** 已实现可启动的 CAN 后端（连接编辑器下拉用） */
+export const CAN_BACKEND_LABELS: Record<CanBackend, string> = {
+  slcan: 'slcan（串口 ASCII，CANable 等）',
+  zlgcan: 'zlgcan（USBCAN/CANalyst-II，待硬件 M2）',
+  candle: 'candle（WinUSB，CANable 原生，待硬件）',
+}
+
+/** 常用 CAN 波特率档位（slcan S 档：S4~S8） */
+export const CAN_BITRATES = [125_000, 250_000, 500_000, 800_000, 1_000_000]
 
 export interface ValueSource {
   kind: SourceKind
@@ -57,6 +74,30 @@ export interface Device {
   points: Point[]
 }
 
+/** CAN 周期报文定义（CAN 连接下的「点位」层） */
+export interface CanPeriodicFrame {
+  id: number
+  /** 0x000~0x7FF 标准 / 0x00000000~0x1FFFFFFF 扩展 */
+  frame_id: number
+  extended: boolean
+  /** 远程帧（数据域为空） */
+  remote: boolean
+  /** ≤8 字节；dlc = data.length */
+  data: number[]
+  /** 发送周期（毫秒）；0 = 不自动发（仅保存定义，手动发送面板可载入） */
+  period_ms: number
+  enabled: boolean
+  note?: string
+}
+
+/** CAN 节点（CAN 连接下的「设备」层：一组周期发送报文） */
+export interface CanNode {
+  id: number
+  name: string
+  enabled: boolean
+  frames: CanPeriodicFrame[]
+}
+
 export interface Transport {
   kind: TransportKind
   /** tcp_server */
@@ -70,6 +111,14 @@ export interface Transport {
   /** tcp_client */
   host?: string
   timeout_ms?: number
+  /** usb_can */
+  backend?: CanBackend | string
+  device_index?: number
+  channel?: number
+  bitrate?: number
+  /** usb_can + slcan：串口名与串口侧波特率 */
+  serial_baud?: number
+  /** can_net */
 }
 
 export interface Connection {
@@ -77,6 +126,8 @@ export interface Connection {
   name: string
   transport: Transport
   devices: Device[]
+  /** CAN 连接下的节点（Modbus 连接恒为空数组） */
+  can_nodes?: CanNode[]
 }
 
 export interface ProjectSpec {
@@ -151,6 +202,31 @@ export interface ConnState {
   detail?: string | null
 }
 
+/** CAN 接收聚合行（ID 聚合视图，运行时状态不进工程文件） */
+export interface CanRxStat {
+  frame_id: number
+  extended: boolean
+  count: number
+  /** 平均到达间隔（毫秒）；不足两个间隔时为 0 */
+  avg_period_ms: number
+  /** 最近一次数据域（大写空格 hex） */
+  last_data: string
+  /** 最近一次到达（epoch 毫秒） */
+  last_ts: number
+}
+
+/** CAN 连接观测快照（聚合行 + 帧率/计数） */
+export interface CanAgg {
+  rows: CanRxStat[]
+  tx_total: number
+  rx_total: number
+  err_total: number
+  /** 发送帧率（帧/秒，滑动窗口） */
+  tx_rate: number
+  /** 接收帧率（帧/秒，滑动窗口） */
+  rx_rate: number
+}
+
 /** 连接编辑器「测试连接 / 检查端口 / 检查串口」结果 */
 export interface TestConnResult {
   ok: boolean
@@ -163,6 +239,8 @@ export const TRANSPORT_LABELS: Record<TransportKind, string> = {
   serial: 'Modbus RTU 从机（串口 485）',
   tcp_client: 'Modbus TCP 主机（连接远端）',
   serial_master: 'Modbus RTU 主机（串口 485 轮询）',
+  usb_can: 'CAN 直采直控（USB-CAN）',
+  can_net: 'CAN 转以太网（ZLG CANET）',
 }
 
 export const AREA_LABELS: Record<Area, string> = {
@@ -252,4 +330,40 @@ export function sourceSummary(s: ValueSource): string {
     case 'swing':
       return `[${s.min ?? 0}, ${s.max ?? 100}] 周期=${s.period_s ?? 20}s`
   }
+}
+
+// ---------- CAN 帧工具（与 Rust 端 can::CanFrame 行为同构，mock 用同一份） ----------
+
+/** CAN 帧（发送面板 / 手动发送命令） */
+export interface CanFrame {
+  frame_id: number
+  extended: boolean
+  remote: boolean
+  data: number[]
+}
+
+/** 帧十六进制字符串 → 字节数组（容错空格/冒号/大小写；长度奇数或空返回 null） */
+export function parseHexBytes(s: string): number[] | null {
+  const cleaned = s.replace(/[^0-9a-fA-F]/g, '')
+  if (cleaned.length === 0 || cleaned.length % 2 !== 0) return null
+  const out: number[] = []
+  for (let i = 0; i < cleaned.length; i += 2) out.push(parseInt(cleaned.slice(i, i + 2), 16))
+  return out
+}
+
+/** 帧监视器 note：ID 按域宽补零 + DLC（+ 扩展/远程标注），与 Rust 端 CanFrame::note 一致 */
+export function canFrameNote(f: CanFrame): string {
+  const hex = (f.extended ? 8 : 3) as number
+  let s = `ID=0x${f.frame_id.toString(16).toUpperCase().padStart(hex, '0')} DLC=${f.data.length}`
+  if (f.remote) s += ' 远程帧'
+  return s
+}
+
+/** 帧定义合法性（与 Rust 端 CanPeriodicFrame::validate 一致）；返回 null = 合法 */
+export function validateCanFrameDef(frame_id: number, extended: boolean, remote: boolean, data: number[]): string | null {
+  const max = extended ? 0x1fffffff : 0x7ff
+  if (frame_id > max) return `帧 ID 0x${frame_id.toString(16).toUpperCase()} 超出${extended ? '扩展' : '标准'}域宽（最大 0x${max.toString(16).toUpperCase()}）`
+  if (data.length > 8) return `数据域 ${data.length} 字节超长（CAN 经典帧最多 8）`
+  if (remote && data.length > 0) return '远程帧不带数据域'
+  return null
 }

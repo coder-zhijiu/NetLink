@@ -39,6 +39,20 @@ pub async fn test_transport(t: &Transport) -> TestConnResult {
         Transport::Serial { serial_port, baud, .. } | Transport::SerialMaster { serial_port, baud, .. } => {
             test_serial(serial_port, *baud)
         }
+        // slcan 后端检测串口占用；zlgcan/candle 未实现直接给出说明
+        Transport::UsbCan { backend, serial_port, serial_baud, .. } => {
+            if backend != "slcan" {
+                return TestConnResult::fail(format!(
+                    "CAN 后端「{backend}」尚未实现（zlgcan/candle 待硬件到货，当前可用：slcan）"
+                ));
+            }
+            match serial_port {
+                Some(name) if !name.is_empty() => test_serial(name, *serial_baud),
+                _ => TestConnResult::fail("slcan 后端需要先配置串口".to_string()),
+            }
+        }
+        // CANET 网关检测与 Modbus TCP 主机一致：真实连一次远端
+        Transport::CanNet { host, port, timeout_ms, .. } => test_tcp_client(host, *port, *timeout_ms).await,
     }
 }
 

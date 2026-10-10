@@ -5,6 +5,7 @@ import DeviceTree from './components/DeviceTree.vue'
 import PointTable from './components/PointTable.vue'
 import FrameMonitor from './components/FrameMonitor.vue'
 import TestFramePanel from './components/TestFramePanel.vue'
+import CanSendPanel from './components/CanSendPanel.vue'
 import { api } from './api'
 import { store, applyUpdate, applyProjectHandle, refreshProjects } from './store'
 import { uiAlert } from './ui-dialog'
@@ -31,7 +32,7 @@ async function loadInitialProject() {
       await uiAlert(`工程文件加载失败：\n${e.message}\n\n已改用空工程；点「保存」将以工程名另存。`)
       applyProjectHandle({
         path: null,
-        spec: { schema_version: 2, name: '未命名工程', connections: [] },
+        spec: { schema_version: 3, name: '未命名工程', connections: [] },
       })
       loadFailed.value = false
     }
@@ -64,6 +65,7 @@ onUnmounted(() => off?.())
     </div>
     <FrameMonitor class="app-monitor panel" />
     <TestFramePanel />
+    <CanSendPanel />
   </div>
 </template>
 

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -206,6 +206,60 @@ pub struct Device {
     pub points: Vec<Point>,
 }
 
+// ---------- CAN 节点与周期报文 ----------
+
+fn d_can_period_ms() -> u32 {
+    1000
+}
+
+/// CAN 周期报文定义（CAN 连接下的「点位」层）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanPeriodicFrame {
+    pub id: u64,
+    /// 0x000~0x7FF 标准 / 0x00000000~0x1FFFFFFF 扩展
+    pub frame_id: u32,
+    pub extended: bool,
+    /// 远程帧（数据域为空）
+    pub remote: bool,
+    /// ≤8 字节；dlc = data.len()
+    #[serde(default)]
+    pub data: Vec<u8>,
+    /// 发送周期（毫秒）；0 = 不自动发（仅保存定义，手动发送面板可载入）
+    #[serde(default = "d_can_period_ms")]
+    pub period_ms: u32,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl CanPeriodicFrame {
+    /// 帧定义合法性：ID 域宽 / 数据长度 / 远程帧数据域
+    pub fn validate(&self) -> Result<(), String> {
+        let max = if self.extended { 0x1FFF_FFFF } else { 0x7FF };
+        if self.frame_id > max {
+            return Err(format!("帧 ID 0x{:X} 超出{}域宽（最大 0x{:X}）", self.frame_id, if self.extended { "扩展" } else { "标准" }, max));
+        }
+        if self.data.len() > 8 {
+            return Err(format!("数据域 {} 字节超长（CAN 经典帧最多 8）", self.data.len()));
+        }
+        if self.remote && !self.data.is_empty() {
+            return Err("远程帧不带数据域".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// CAN 节点（CAN 连接下的「设备」层：一组周期发送报文；接收侧是运行时聚合不进工程）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanNode {
+    pub id: u64,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub frames: Vec<CanPeriodicFrame>,
+}
+
 // ---------- 传输 / 连接 / 工程 ----------
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +285,21 @@ fn default_timeout_ms() -> u32 {
 }
 fn default_poll_period() -> u32 {
     1000
+}
+fn default_can_backend() -> String {
+    "slcan".to_string()
+}
+fn default_device_index() -> u32 {
+    0
+}
+fn default_can_channel() -> u8 {
+    0
+}
+fn default_can_bitrate() -> u32 {
+    500_000
+}
+fn default_serial_baud() -> u32 {
+    115_200
 }
 
 /// 一条总线的传输方式（内部标签 `kind`，与前端 Transport 同构）。
@@ -270,6 +339,37 @@ pub enum Transport {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u32,
     },
+    /// CAN 直采直控：USB-CAN 适配器直连总线（被动监听全量报文 + 手动/周期发送）
+    UsbCan {
+        /// "slcan"（v1 已实现）；"zlgcan" / "candle" 待硬件到货启用
+        #[serde(default = "default_can_backend")]
+        backend: String,
+        /// zlgcan 设备号；candle 通道路径序号（slcan 忽略）
+        #[serde(default = "default_device_index")]
+        device_index: u32,
+        /// CAN 通道号（双通道设备 0/1）
+        #[serde(default = "default_can_channel")]
+        channel: u8,
+        /// 常用档位 125k/250k/500k/1M；zlgcan 内部换算 Timing0/1（M2）
+        #[serde(default = "default_can_bitrate")]
+        bitrate: u32,
+        /// slcan 后端的串口名（其余后端忽略）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        serial_port: Option<String>,
+        /// slcan 后端的串口侧波特率（适配器固件常为 115200）
+        #[serde(default = "default_serial_baud")]
+        serial_baud: u32,
+    },
+    /// CAN 转以太网：TCP 连接 ZLG CANET 网关收发 CAN 帧（M3 实现；v3 schema 先占位）
+    CanNet {
+        host: String,
+        port: u16,
+        /// 映射 CANET 的哪路 CAN
+        #[serde(default = "default_can_channel")]
+        channel: u8,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,7 +377,11 @@ pub struct Connection {
     pub id: u64,
     pub name: String,
     pub transport: Transport,
+    #[serde(default)]
     pub devices: Vec<Device>,
+    /// CAN 连接下的节点（替代「设备」层；Modbus 连接恒为空）
+    #[serde(default)]
+    pub can_nodes: Vec<CanNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +509,7 @@ impl ProjectSpec {
                         port: 502,
                     },
                     devices: vec![dev1, dev2],
+                    can_nodes: vec![],
                 },
                 Connection {
                     id: 2,
@@ -416,6 +521,7 @@ impl ProjectSpec {
                         stop_bits: 1,
                     },
                     devices: vec![dev3],
+                    can_nodes: vec![],
                 },
                 // 主机连接：连本工具自己模拟的从机（127.0.0.1:502），
                 // 演示「同一工程一边模拟从机、一边当主站打它」的自测玩法
@@ -441,6 +547,65 @@ impl ProjectSpec {
                             pt(&mut id, "有功设定", Area::HoldingRegister, 0, DataType::F32, ValueSource::Static { value: 0.0 }),
                         ],
                     }],
+                    can_nodes: vec![],
+                },
+                // CAN 直采直控示例：slcan 后端（CANable 等）；串口名按实际适配器修改后启动
+                Connection {
+                    id: 4,
+                    name: "CAN 总线 (slcan COM5)".to_string(),
+                    transport: Transport::UsbCan {
+                        backend: default_can_backend(),
+                        device_index: 0,
+                        channel: 0,
+                        bitrate: 500_000,
+                        serial_port: Some("COM5".to_string()),
+                        serial_baud: default_serial_baud(),
+                    },
+                    devices: vec![],
+                    can_nodes: vec![
+                        CanNode {
+                            id: 401,
+                            name: "1号CAN节点".to_string(),
+                            enabled: true,
+                            frames: vec![
+                                CanPeriodicFrame {
+                                    id: 4011,
+                                    frame_id: 0x123,
+                                    extended: false,
+                                    remote: false,
+                                    data: vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+                                    period_ms: 1000,
+                                    enabled: true,
+                                    note: Some("状态周期帧".to_string()),
+                                },
+                                CanPeriodicFrame {
+                                    id: 4012,
+                                    frame_id: 0x201,
+                                    extended: false,
+                                    remote: false,
+                                    data: vec![0x01, 0x02],
+                                    period_ms: 250,
+                                    enabled: true,
+                                    note: Some("快速心跳".to_string()),
+                                },
+                            ],
+                        },
+                        CanNode {
+                            id: 402,
+                            name: "2号CAN节点".to_string(),
+                            enabled: false,
+                            frames: vec![CanPeriodicFrame {
+                                id: 4021,
+                                frame_id: 0x18FF0102,
+                                extended: true,
+                                remote: false,
+                                data: vec![0xAA, 0x55],
+                                period_ms: 2000,
+                                enabled: true,
+                                note: None,
+                            }],
+                        },
+                    ],
                 },
             ],
         }

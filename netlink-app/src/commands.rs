@@ -547,6 +547,15 @@ async fn ensure_runtime(app: &AppHandle, state: &AppState) -> RuntimeManager {
                 cm.insert(id.to_string(), json!({ "kind": kind, "detail": detail }));
             }
             patch.insert("conn_states".into(), Value::Object(cm));
+            // CAN 连接观测（接收聚合 + 帧率；替换式，非 CAN 连接不出现）
+            let can = push_manager.snapshot_can_rx();
+            if !can.is_empty() {
+                let mut km = Map::new();
+                for (id, snap) in can {
+                    km.insert(id.to_string(), json!(snap));
+                }
+                patch.insert("can_rx".into(), Value::Object(km));
+            }
             let _ = app_values.emit(UPDATE_EVENT, Value::Object(patch));
         }
     });
@@ -695,4 +704,18 @@ pub async fn send_test_frame(
         None => return Err("模拟未启动".to_string()),
     };
     Ok(netlink_core::protocol::hex_str(&resp))
+}
+
+/// CAN 手动发送一帧（连接编辑器/发送面板；帧结构字段与前端 snake_case 对齐）
+#[tauri::command]
+pub async fn send_can_frame(
+    state: State<'_, AppState>,
+    conn_id: u64,
+    frame: netlink_core::protocol::can::CanFrame,
+) -> Result<(), String> {
+    let guard = state.manager.lock().await;
+    match &*guard {
+        Some(m) => m.send_can_frame(conn_id, frame).await,
+        None => Err("模拟未启动".to_string()),
+    }
 }

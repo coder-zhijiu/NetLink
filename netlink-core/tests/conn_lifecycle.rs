@@ -21,6 +21,7 @@ fn one_conn_project(port: u16) -> ProjectSpec {
                 listen_addr: "127.0.0.1".into(),
                 port,
             },
+            can_nodes: vec![],
             devices: vec![
                 Device {
                     id: 1,

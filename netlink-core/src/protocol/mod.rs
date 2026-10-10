@@ -1,5 +1,6 @@
 //! 协议实现层。
 
+pub mod can;
 pub mod modbus;
 
 use serde::Serialize;
