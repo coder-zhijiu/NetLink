@@ -8,6 +8,7 @@ import {
   AREA_LABELS,
   AREA_BASE,
   DATA_TYPE_LABELS,
+  FAULT_LABELS,
   SOURCE_LABELS,
   areaGlobalAddr,
   formatValue,
@@ -37,6 +38,28 @@ const vFocus = {
 
 // 主机模式：采集健康徽标
 const stat = computed(() => (device.value ? store.stats[device.value.id] : undefined))
+
+/** ● 采集 徽章状态：
+ *  最近一轮失败（last_error 有值）= 红；有失败史但长期无成功 = 红；正常 = 绿。
+ *  间歇性失败（成功穿插）也会在失败后立即变红，下轮成功恢复绿。 */
+const collectState = computed<'' | 'okc' | 'bad'>(() => {
+  const s = stat.value
+  if (!s) return ''
+  if (s.last_error) return 'bad'
+  if (s.last_ok_ms === 0) return s.timeout_count + s.fail_count > 0 ? 'bad' : ''
+  const period = device.value?.poll_period_ms ?? 1000
+  return Date.now() - s.last_ok_ms >= period * 3 + 1500 ? 'bad' : 'okc'
+})
+
+/** 采集健康徽章悬浮：健康含义 + 最近一次失败原因 + 累计计数 */
+function statTitle(): string {
+  const s = stat.value
+  if (!s) return '采集健康'
+  const lines = ['采集健康：最近一轮采集成功即绿色，失败显示红色并标注原因']
+  if (s.last_error) lines.push(`上次失败：${s.last_error}`)
+  if (s.timeout_count || s.fail_count) lines.push(`累计：超时 ${s.timeout_count} · 失败 ${s.fail_count}`)
+  return lines.join('\n')
+}
 
 function fmtLastOk(ms: number): string {
   if (!ms) return '从未'
@@ -298,12 +321,12 @@ async function onExport() {
         <span v-for="(n, a) in areaStat" :key="a" class="chip">{{ AREA_LABELS[a as Area] }} × {{ n }}</span>
         <template v-if="isMaster">
           <span v-if="connRunning" class="chip" title="主机模式：当前值列带 ✎ 的点位（线圈/保持寄存器）可点击直接写值下发；输入区只读">✎ 值列可写</span>
-          <span class="chip" :class="{ okc: stat && Date.now() - stat.last_ok_ms < (device.poll_period_ms ?? 1000) * 3 + 1500, bad: stat && Date.now() - stat.last_ok_ms >= (device.poll_period_ms ?? 1000) * 3 + 1500 }" title="采集健康">● 采集</span>
+          <span class="chip" :class="collectState" :title="statTitle()">● {{ collectState === 'bad' ? '采集异常' : '采集' }}</span>
           <span class="chip mono" title="请求超时累计">超时 {{ stat?.timeout_count ?? 0 }}</span>
-          <span class="chip mono" title="失败累计">失败 {{ stat?.fail_count ?? 0 }}</span>
+          <span class="chip mono" :class="{ bad: !!stat?.last_error }" :title="stat?.last_error ? `最近失败：${stat.last_error}` : '失败累计'">失败 {{ stat?.fail_count ?? 0 }}</span>
           <span class="chip mono" :title="`轮询周期 ${device.poll_period_ms ?? 1000}ms`">{{ fmtLastOk(stat?.last_ok_ms ?? 0) }}</span>
         </template>
-        <span v-else-if="device.fault.kind !== 'normal'" class="chip fault">故障：{{ device.fault.kind === 'delay' ? `延迟 ${device.fault.delay_ms}ms` : device.fault.kind === 'timeout' ? '超时' : '异常码' }}</span>
+        <span v-else-if="device.fault.kind !== 'normal'" class="chip fault">故障：{{ device.fault.kind === 'delay' ? `延迟 ${device.fault.delay_ms}ms` : FAULT_LABELS[device.fault.kind] }}</span>
         <span v-if="writeError" class="chip bad" :title="writeError">⚠ 写入失败</span>
       </template>
       <div class="spacer" />

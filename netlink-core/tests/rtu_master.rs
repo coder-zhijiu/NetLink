@@ -24,6 +24,17 @@ struct FakeRtuIo {
     slave: Arc<Mutex<DeviceRuntime>>,
     /// 只应答这个从机地址（其他地址静默，模拟总线上无此设备）
     unit: u8,
+    /// 从机故障模拟（测主机侧采集统计/监视器标注）
+    fault: FakeFault,
+}
+
+/// 假从机故障：静默（超时）/ 坏 CRC（脏帧）/ 异常码
+#[derive(Clone, Copy)]
+enum FakeFault {
+    None,
+    Silent,
+    CorruptCrc,
+    Exception(u8),
 }
 
 impl RtuIo for FakeRtuIo {
@@ -59,15 +70,24 @@ impl FakeRtuIo {
         if addr != self.unit {
             return; // 非本站：不应答
         }
+        if matches!(self.fault, FakeFault::Silent) {
+            return; // 超时故障：不应答
+        }
         let pdu_req = &frame[1..n - 2];
-        let resp_pdu = {
-            let mut g = self.slave.lock().unwrap();
-            pdu::process_request(pdu_req, &mut g).expect("应答 PDU")
+        let resp_pdu = match self.fault {
+            FakeFault::Exception(code) => vec![pdu_req[0] | 0x80, code],
+            _ => {
+                let mut g = self.slave.lock().unwrap();
+                pdu::process_request(pdu_req, &mut g).expect("应答 PDU")
+            }
         };
         let mut out = Vec::with_capacity(3 + resp_pdu.len());
         out.push(addr);
         out.extend_from_slice(&resp_pdu);
-        let c = crc16(&out);
+        let mut c = crc16(&out);
+        if matches!(self.fault, FakeFault::CorruptCrc) {
+            c ^= 1; // 脏帧：翻转一位
+        }
         out.extend_from_slice(&c.to_le_bytes());
         self.to_master.extend(out);
     }
@@ -189,6 +209,7 @@ async fn rtu_master_polls_writes_and_rejects_readonly() {
         pending: Vec::new(),
         slave: slave_rt.clone(),
         unit: 7,
+        fault: FakeFault::None,
     };
 
     let task = tokio::spawn(serve_rtu_with(ctx, Box::new(io), 300, cancel.clone(), rx));
@@ -251,6 +272,123 @@ async fn rtu_master_polls_writes_and_rejects_readonly() {
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
     assert!(!AtomicBool::new(false).load(Ordering::Relaxed)); // 占位避免未用导入
+}
+
+/// 从机超时故障（不应答）：主机统计超时计数 + last_error + 监视器「(超时无应答)」事件
+#[tokio::test(flavor = "multi_thread")]
+async fn rtu_master_timeout_marks_stat_and_monitor() {
+    let master_rt = Arc::new(Mutex::new(DeviceRuntime::new(&master_device())));
+
+    let manager = RuntimeManager::new();
+    let mut frame_rx = manager.subscribe_frames();
+    let ctx = Arc::new(ConnCtx {
+        conn_id: 9,
+        devices: vec![master_rt.clone()],
+        clock: SimClock::new(),
+        manager: manager.clone(),
+    });
+
+    let (_tx, rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let io = FakeRtuIo {
+        to_master: VecDeque::new(),
+        pending: Vec::new(),
+        slave: Arc::new(Mutex::new(DeviceRuntime::new(&slave_device()))),
+        unit: 7,
+        fault: FakeFault::Silent,
+    };
+    let task = tokio::spawn(serve_rtu_with(ctx, Box::new(io), 80, cancel.clone(), rx));
+
+    let ok = wait_until(5000, || master_rt.lock().unwrap().timeout_count > 0).await;
+    assert!(
+        ok,
+        "超时未计数: timeout_count={}",
+        master_rt.lock().unwrap().timeout_count
+    );
+    assert_eq!(master_rt.lock().unwrap().last_error.as_deref(), Some("超时无应答"));
+
+    let mut saw_timeout_note = false;
+    while let Ok(ev) = frame_rx.try_recv() {
+        if ev.note.as_deref().is_some_and(|n| n.contains("超时无应答")) {
+            saw_timeout_note = true;
+        }
+    }
+    assert!(saw_timeout_note, "监视器应出现「(超时无应答)」标注事件");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+}
+
+/// 从机异常码应答：主机失败计数 + last_error 带异常码
+#[tokio::test(flavor = "multi_thread")]
+async fn rtu_master_exception_marks_last_error() {
+    let master_rt = Arc::new(Mutex::new(DeviceRuntime::new(&master_device())));
+
+    let manager = RuntimeManager::new();
+    let ctx = Arc::new(ConnCtx {
+        conn_id: 9,
+        devices: vec![master_rt.clone()],
+        clock: SimClock::new(),
+        manager: manager.clone(),
+    });
+
+    let (_tx, rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let io = FakeRtuIo {
+        to_master: VecDeque::new(),
+        pending: Vec::new(),
+        slave: Arc::new(Mutex::new(DeviceRuntime::new(&slave_device()))),
+        unit: 7,
+        fault: FakeFault::Exception(0x04),
+    };
+    let task = tokio::spawn(serve_rtu_with(ctx, Box::new(io), 300, cancel.clone(), rx));
+
+    let ok = wait_until(5000, || master_rt.lock().unwrap().fail_count > 0).await;
+    assert!(
+        ok,
+        "异常应答未计入失败: fail_count={}",
+        master_rt.lock().unwrap().fail_count
+    );
+    assert_eq!(master_rt.lock().unwrap().last_error.as_deref(), Some("异常应答 code=0x04"));
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+}
+
+/// 从机脏帧（坏 CRC）：主机失败计数 + last_error（回归：此前 RTU 路径 CRC 错误不计统计）
+#[tokio::test(flavor = "multi_thread")]
+async fn rtu_master_corrupt_crc_marks_last_error() {
+    let master_rt = Arc::new(Mutex::new(DeviceRuntime::new(&master_device())));
+
+    let manager = RuntimeManager::new();
+    let ctx = Arc::new(ConnCtx {
+        conn_id: 9,
+        devices: vec![master_rt.clone()],
+        clock: SimClock::new(),
+        manager: manager.clone(),
+    });
+
+    let (_tx, rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let io = FakeRtuIo {
+        to_master: VecDeque::new(),
+        pending: Vec::new(),
+        slave: Arc::new(Mutex::new(DeviceRuntime::new(&slave_device()))),
+        unit: 7,
+        fault: FakeFault::CorruptCrc,
+    };
+    let task = tokio::spawn(serve_rtu_with(ctx, Box::new(io), 300, cancel.clone(), rx));
+
+    let ok = wait_until(5000, || master_rt.lock().unwrap().fail_count > 0).await;
+    assert!(
+        ok,
+        "CRC 错误未计入失败: fail_count={}",
+        master_rt.lock().unwrap().fail_count
+    );
+    assert_eq!(master_rt.lock().unwrap().last_error.as_deref(), Some("CRC 校验失败"));
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
 }
 
 /// serial_master 传输的序列化往返（工程文件兼容性）

@@ -5,11 +5,12 @@
 use std::time::Duration;
 
 use netlink_core::model::{
-    Area, Connection, DataType, Device, FaultConfig, Point, ProjectSpec, Transport, ValueSource,
+    Area, Connection, DataType, Device, FaultConfig, FaultKind, Point, ProjectSpec, Transport, ValueSource,
 };
-use netlink_core::runtime::{encode_words, RuntimeManager};
+use netlink_core::runtime::{encode_words, ConnStateKind, RuntimeManager};
 
 const PORT: u16 = 15040;
+const PORT2: u16 = 15041;
 
 fn point(id: u64, name: &str, area: Area, addr: u16, dt: DataType) -> Point {
     Point {
@@ -24,7 +25,7 @@ fn point(id: u64, name: &str, area: Area, addr: u16, dt: DataType) -> Point {
 }
 
 /// 被采集的从机（端口 PORT）：holding 0 f32=123.5 / input 0 f32=456.25 / coil 0 = 1
-fn slave_project() -> ProjectSpec {
+fn slave_project(port: u16) -> ProjectSpec {
     ProjectSpec {
         schema_version: 2,
         name: "slave".into(),
@@ -33,7 +34,7 @@ fn slave_project() -> ProjectSpec {
             name: "被采从机".into(),
             transport: Transport::TcpServer {
                 listen_addr: "127.0.0.1".into(),
-                port: PORT,
+                port,
             },
             devices: vec![Device {
                 id: 901,
@@ -86,7 +87,7 @@ fn slave_project() -> ProjectSpec {
 }
 
 /// 主机（连 PORT）：轮询 200ms，点表与从机一致
-fn master_project() -> ProjectSpec {
+fn master_project(port: u16) -> ProjectSpec {
     ProjectSpec {
         schema_version: 2,
         name: "master".into(),
@@ -95,7 +96,7 @@ fn master_project() -> ProjectSpec {
             name: "采集主机".into(),
             transport: Transport::TcpClient {
                 host: "127.0.0.1".into(),
-                port: PORT,
+                port,
                 timeout_ms: 400,
             },
             devices: vec![Device {
@@ -134,10 +135,10 @@ async fn wait_until<F: Fn() -> bool>(ms: u64, f: F) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn master_polls_writes_testframe_and_reconnects() {
     let slave = RuntimeManager::new();
-    slave.start(&slave_project()).await.unwrap();
+    slave.start(&slave_project(PORT)).await.unwrap();
 
     let master = RuntimeManager::new();
-    master.start(&master_project()).await.unwrap();
+    master.start(&master_project(PORT)).await.unwrap();
 
     // ---- 1. 采集值正确（主机连从机可能经历首轮失败重试，等待足够时间） ----
     let ok = wait_until(8000, || {
@@ -163,6 +164,17 @@ async fn master_polls_writes_testframe_and_reconnects() {
     let stats = master.snapshot_stats();
     let s = stats.iter().find(|(id, ..)| *id == 902).expect("stats 缺 902");
     assert!(s.1 > 0, "last_ok_ms 应已更新");
+    assert_eq!(s.4, None, "正常采集不应有失败原因");
+
+    // 链路状态：已连接
+    let ok = wait_until(3000, || {
+        master
+            .snapshot_conn_states()
+            .iter()
+            .any(|(id, k, _)| *id == 5 && *k == ConnStateKind::Connected)
+    })
+    .await;
+    assert!(ok, "主机连接应处于已连接状态: {:?}", master.snapshot_conn_states());
 
     // ---- 2. 写点：主机写 999.0 → 从机侧生效 → 主机下轮采到 ----
     master.write_point(902, 21, 999.0).await.unwrap();
@@ -192,9 +204,18 @@ async fn master_polls_writes_testframe_and_reconnects() {
 
     // ---- 4. 断线重连：停从机（连接被重置→主机走重连路径）→ 从机回来 → 采集恢复 ----
     slave.stop_all();
+    // 断开后应推送「重连中」链路状态（含失败原因细节）
+    let reconnecting = wait_until(3000, || {
+        master
+            .snapshot_conn_states()
+            .iter()
+            .any(|(id, k, _)| *id == 5 && *k == ConnStateKind::Reconnecting)
+    })
+    .await;
+    assert!(reconnecting, "断开后应推送重连中状态: {:?}", master.snapshot_conn_states());
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    slave.start(&slave_project()).await.unwrap();
+    slave.start(&slave_project(PORT)).await.unwrap();
     let ok = wait_until(15000, || {
         let vals = master.snapshot_values(902);
         // 重启后的从机恢复初始值 123.5（或写入残留 999 的任一有效采集）
@@ -204,6 +225,49 @@ async fn master_polls_writes_testframe_and_reconnects() {
     })
     .await;
     assert!(ok, "断线重连后未恢复采集: {:?}", master.snapshot_values(902));
+
+    master.stop_all();
+    slave.stop_all();
+}
+
+/// 从机超时故障（TCP）：主机超时计数 + last_error + 监视器「(超时无应答)」事件
+#[tokio::test(flavor = "multi_thread")]
+async fn master_timeout_fault_marks_stat_and_monitor() {
+    let slave = RuntimeManager::new();
+    let mut sp = slave_project(PORT2);
+    sp.connections[0].devices[0].fault = FaultConfig {
+        kind: FaultKind::Timeout,
+        delay_ms: None,
+        exception_code: None,
+    };
+    slave.start(&sp).await.unwrap();
+
+    let master = RuntimeManager::new();
+    let mut frame_rx = master.subscribe_frames();
+    master.start(&master_project(PORT2)).await.unwrap();
+
+    let ok = wait_until(10000, || {
+        master
+            .snapshot_stats()
+            .iter()
+            .any(|(id, _, to, ..)| *id == 902 && *to > 0)
+    })
+    .await;
+    assert!(ok, "主机超时未计数: {:?}", master.snapshot_stats());
+    let st = master
+        .snapshot_stats()
+        .into_iter()
+        .find(|(id, ..)| *id == 902)
+        .unwrap();
+    assert_eq!(st.4.as_deref(), Some("超时无应答"));
+
+    let mut saw_timeout_note = false;
+    while let Ok(ev) = frame_rx.try_recv() {
+        if ev.note.as_deref().is_some_and(|n| n.contains("超时无应答")) {
+            saw_timeout_note = true;
+        }
+    }
+    assert!(saw_timeout_note, "监视器应出现「(超时无应答)」标注事件");
 
     master.stop_all();
     slave.stop_all();

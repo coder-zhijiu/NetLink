@@ -3,7 +3,7 @@
 export type Area = 'coil' | 'discrete_input' | 'holding_register' | 'input_register'
 export type DataType = 'u16' | 'i16' | 'u32' | 'i32' | 'f32' | 'u64' | 'i64' | 'f64'
 export type SourceKind = 'static' | 'sine' | 'ramp' | 'random_walk' | 'swing'
-export type FaultKind = 'normal' | 'timeout' | 'delay' | 'exception'
+export type FaultKind = 'normal' | 'timeout' | 'delay' | 'exception' | 'corrupt' | 'disconnect'
 export type TransportKind = 'tcp_server' | 'serial' | 'tcp_client' | 'serial_master'
 export type Parity = 'none' | 'even' | 'odd'
 
@@ -140,6 +140,15 @@ export interface DevStat {
   last_ok_ms: number
   timeout_count: number
   fail_count: number
+  /** 最近一次采集失败原因（成功采集后清空；仅主机侧设备维护） */
+  last_error?: string | null
+}
+
+/** 主机连接链路状态 */
+export interface ConnState {
+  kind: 'connecting' | 'connected' | 'reconnecting'
+  /** 断开原因等细节（悬浮提示展示） */
+  detail?: string | null
 }
 
 /** 连接编辑器「测试连接 / 检查端口 / 检查串口」结果 */
@@ -200,6 +209,15 @@ export const FAULT_LABELS: Record<FaultKind, string> = {
   timeout: '超时不响应',
   delay: '延迟响应',
   exception: '异常码应答',
+  corrupt: '脏帧 (CRC 错误)',
+  disconnect: '断连',
+}
+
+/** 脏帧（CRC 破坏）仅对串口传输有意义；断连仅对 TCP 有意义（按设备所属连接过滤） */
+export function isFaultKindAllowedForTransport(kind: FaultKind, transport: TransportKind): boolean {
+  if (kind === 'corrupt') return transport === 'serial'
+  if (kind === 'disconnect') return transport === 'tcp_server'
+  return true
 }
 
 /** 按 data_type 格式化显示值 */

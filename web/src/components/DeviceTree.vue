@@ -18,7 +18,7 @@ import {
   runningDevicesOfConn,
 } from '../store'
 import type { Connection, Device, Transport, TransportKind, FaultKind, Parity, TestConnResult } from '../types'
-import { FAULT_LABELS, TRANSPORT_LABELS, isMasterTransport } from '../types'
+import { FAULT_LABELS, TRANSPORT_LABELS, isFaultKindAllowedForTransport, isMasterTransport } from '../types'
 import { uiAlert, uiConfirm } from '../ui-dialog'
 import DrawerShell from './DrawerShell.vue'
 import { openTestPanel } from '../store'
@@ -40,24 +40,55 @@ function transportSummary(t: Transport): string {
 /** 连接行悬浮提示：名称 + 传输类型 + 端点（取代行内徽章，避免挤压行） */
 function connTooltip(conn: Connection): string {
   const lines = [conn.name, `${TRANSPORT_LABELS[conn.transport.kind]} · ${transportSummary(conn.transport)}`]
-  if (isMasterConn(conn)) lines.push('主机连接：主动连接/轮询远端从机')
+  if (isMasterConn(conn)) {
+    lines.push('主机连接：主动连接/轮询远端从机')
+    const st = store.connStates[conn.id]
+    if (st) {
+      const label = CONN_STATE_LABELS[st.kind]
+      lines.push(`链路状态：${label}${st.detail ? `（${st.detail}）` : ''}`)
+    }
+  }
   return lines.join('\n')
+}
+
+/** 主机连接链路状态文案 */
+const CONN_STATE_LABELS: Record<string, string> = {
+  connecting: '连接中',
+  connected: '已连接',
+  reconnecting: '重连中',
+}
+
+/** 主机连接链路异常徽章（连接中/重连中才显示；已连接不占行内空间） */
+function connStateBadge(conn: Connection): { label: string; title: string } | null {
+  if (!isMasterConn(conn) || !connRunning(conn.id)) return null
+  const st = store.connStates[conn.id]
+  if (!st || st.kind === 'connected') return null
+  const label = CONN_STATE_LABELS[st.kind] ?? st.kind
+  return { label, title: st.detail ? `${label}：${st.detail}` : label }
 }
 
 /** 设备行悬浮提示：名称 + 从机地址 + 点数（ID 徽章移入提示） */
 function devTooltip(dev: Device): string {
   const lines = [`${dev.name}（从机地址 ID ${dev.slave_id}）`, `${dev.points.length} 个点位`]
   if (dev.fault.kind !== 'normal') lines.push(`故障注入：${FAULT_LABELS[dev.fault.kind]}`)
+  // 主机设备：最近一次采集失败原因（成功后清除）
+  const conn = (store.project?.connections ?? []).find((c) => c.devices.some((d) => d.id === dev.id))
+  if (conn && isMasterConn(conn)) {
+    const st = store.stats[dev.id]
+    if (st?.last_error) lines.push(`采集异常：${st.last_error}`)
+  }
   return lines.join('\n')
 }
 
-/** 主机设备采集健康：true = 最近 3 个周期内有成功 */
+/** 主机设备采集健康：false = 最近一轮失败或长期无成功（红点）；true = 正常 */
 function devHealthy(dev: Device): boolean | null {
   if (store.selectedDeviceId == null) return null
   const conn = (store.project?.connections ?? []).find((c) => c.devices.some((d) => d.id === dev.id))
   if (!conn || !isMasterConn(conn)) return null
   const st = store.stats[dev.id]
-  if (!st || st.last_ok_ms === 0) return false
+  if (!st) return false
+  if (st.last_error) return false // 最近一轮采集失败：立即红（间歇性失败也可见）
+  if (st.last_ok_ms === 0) return st.timeout_count + st.fail_count > 0
   return Date.now() - st.last_ok_ms < (dev.poll_period_ms ?? 1000) * 3 + 1500
 }
 
@@ -434,6 +465,11 @@ function openDevEditor(connId: number, d: Device | null) {
     devEdit.exceptionCode = 1
     devEdit.pollPeriodMs = 1000
   }
+  // 兜底：工程文件手工改出与传输方式不匹配的故障（如串口设备配断连）时回退为正常
+  const tkind = store.project?.connections.find((c) => c.id === devEdit.connId)?.transport.kind
+  if (tkind != null && !isFaultKindAllowedForTransport(devEdit.faultKind, tkind)) {
+    devEdit.faultKind = 'normal'
+  }
   devEditorOpen.value = true
 }
 
@@ -481,7 +517,22 @@ async function delDev(dev: Device) {
   if (conn) await restartConnIfRunning(conn.id)
 }
 
-const faultOptions = (Object.keys(FAULT_LABELS) as FaultKind[]).map((k) => ({ label: FAULT_LABELS[k], value: k }))
+/** 故障选项按所属连接的传输方式过滤：脏帧仅串口（CRC 校验和），断连仅 TCP（连接概念） */
+const faultOptions = computed(() => {
+  const kind = store.project?.connections.find((c) => c.id === devEdit.connId)?.transport.kind
+  return (Object.keys(FAULT_LABELS) as FaultKind[])
+    .filter((k) => kind == null || isFaultKindAllowedForTransport(k, kind))
+    .map((k) => ({ label: FAULT_LABELS[k], value: k }))
+})
+/** 故障区提示文案：选中新故障时说明行为，正常时按传输方式列出可注入项 */
+const faultTip = computed(() => {
+  if (devEdit.faultKind === 'corrupt') return '应答内容正常但 CRC 翻转一位，主机侧将报「CRC 校验失败」并丢弃。'
+  if (devEdit.faultKind === 'disconnect') return '收到任意请求后不应答、立即关闭该 TCP 连接；监听保持，主站重连后再次触发。'
+  const kind = store.project?.connections.find((c) => c.id === devEdit.connId)?.transport.kind
+  const extra = kind === 'serial' ? '脏帧（应答 CRC 破坏）' : '断连（收到请求即断开连接）'
+  return `用于测上位机对坏设备的容错：超时不应答、延迟应答、固定异常码或${extra}。`
+})
+
 const parityOptions: Array<{ label: string; value: Parity }> = [
   { label: '无校验', value: 'none' },
   { label: '偶校验', value: 'even' },
@@ -511,6 +562,11 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
           <div class="node conn-node" :title="connTooltip(conn)" @contextmenu="connMenu($event, conn)">
             <span class="icon">{{ isMasterConn(conn) ? '🔌' : '🔀' }}</span>
             <span class="label">{{ conn.name }}</span>
+            <span
+              v-if="connStateBadge(conn)"
+              class="chip state"
+              :title="connStateBadge(conn)?.title"
+            >{{ connStateBadge(conn)?.label }}</span>
             <button
               class="node-btn"
               :class="{ on: connRunning(conn.id) }"
@@ -704,12 +760,14 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
           <span class="f-lab">延迟(ms)</span>
           <input v-model.number="devEdit.delayMs" type="number" min="0" step="50" class="mono" />
         </div>
-        <div v-else-if="devEdit.faultKind === 'exception'" class="f-row">
-          <span class="f-lab">异常码</span>
-          <input v-model.number="devEdit.exceptionCode" type="number" min="1" max="255" class="mono" />
-          <span class="tip-inline">01 非法功能 / 02 非法地址 / 03 非法值 / 04 从站故障</span>
-        </div>
-        <p v-else class="tip">用于测上位机对坏设备的容错：超时不应答、延迟应答或固定异常码。</p>
+        <template v-else-if="devEdit.faultKind === 'exception'">
+          <div class="f-row">
+            <span class="f-lab">异常码</span>
+            <input v-model.number="devEdit.exceptionCode" type="number" min="1" max="255" class="mono" />
+          </div>
+          <p class="tip">01 非法功能 / 02 非法地址 / 03 非法值 / 04 从站故障</p>
+        </template>
+        <p v-else class="tip">{{ faultTip }}</p>
       </div>
 
       <template #footer>
@@ -788,6 +846,14 @@ const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
   color: var(--warn);
   border-color: var(--warn);
   flex: none;
+}
+
+/* 主机连接链路异常徽章（连接中/重连中；已连接不显示） */
+.chip.state {
+  color: var(--warn);
+  border-color: var(--warn);
+  flex: none;
+  white-space: nowrap;
 }
 
 .dot.bad {

@@ -21,7 +21,7 @@ use super::{find_device_id, ConnCtx};
 use crate::model::Area;
 use crate::model::DataType;
 use crate::protocol::FrameEvent;
-use crate::runtime::DeviceRuntime;
+use crate::runtime::{ConnStateKind, DeviceRuntime};
 
 /// 调度器命令（来自 Manager）
 pub enum MasterMsg {
@@ -61,12 +61,17 @@ pub async fn serve(
         if cancel.is_cancelled() {
             return;
         }
+        ctx.manager.set_conn_state(ctx.conn_id, ConnStateKind::Connecting, None);
         let mut stream = match TcpStream::connect((host.as_str(), port)).await {
             Ok(s) => {
                 backoff = Duration::from_secs(1);
+                ctx.manager.set_conn_state(ctx.conn_id, ConnStateKind::Connected, None);
                 s
             }
             Err(e) => {
+                let detail = format!("{e}，{}ms 后重试", backoff.as_millis());
+                ctx.manager
+                    .set_conn_state(ctx.conn_id, ConnStateKind::Reconnecting, Some(detail));
                 eprintln!("[netlink] 主机连接 {host}:{port} 失败（{e}），{}ms 后重试", backoff.as_millis());
                 tokio::select! {
                     _ = cancel.cancelled() => return,
@@ -81,6 +86,11 @@ pub async fn serve(
         match dispatch(&mut stream, &ctx, &devices, timeout_ms, &mut rx, &cancel).await {
             Ok(()) => return, // 取消
             Err(e) => {
+                ctx.manager.set_conn_state(
+                    ctx.conn_id,
+                    ConnStateKind::Reconnecting,
+                    Some(format!("{e}，重连中")),
+                );
                 eprintln!("[netlink] 主机连接 {host}:{port} 断开（{e}），重连…");
                 tokio::select! {
                     _ = cancel.cancelled() => return,
@@ -186,6 +196,14 @@ impl Dispatcher {
                 }
             }
         }
+        // 重试全部超时：补一条超时标注事件（与从机侧「(超时不响应)」对称）
+        ctx.manager.emit_frame(FrameEvent::new(
+            ctx.conn_id,
+            find_device_id(ctx, unit),
+            "in",
+            &[],
+            Some("(超时无应答)".to_string()),
+        ));
         Err("超时".to_string())
     }
 }
@@ -303,17 +321,24 @@ async fn poll_device(
 }
 
 /// 解析采集应答并导入设备运行时；返回应答是否正常
-fn apply_response(dev: &Arc<Mutex<DeviceRuntime>>, area: Area, start: u16, qty: u16, resp: &[u8]) -> bool {
+/// 采集应答导入设备运行时（TCP 与 RTU 主机共用）；Err = 应答内容异常（原因入采集统计）
+fn apply_response(
+    dev: &Arc<Mutex<DeviceRuntime>>,
+    area: Area,
+    start: u16,
+    qty: u16,
+    resp: &[u8],
+) -> Result<(), String> {
     if resp.len() < 2 {
-        return false;
+        return Err("应答过短".to_string());
     }
     let fc = resp[0];
     if fc & 0x80 != 0 {
-        return false; // 异常应答
+        return Err(format!("异常应答 code=0x{:02X}", resp[1])); // 异常应答
     }
     let count = resp[1] as usize;
     if resp.len() < 2 + count {
-        return false;
+        return Err("应答长度不符".to_string());
     }
     let data = &resp[2..2 + count];
     let mut g = dev.lock().unwrap();
@@ -331,7 +356,7 @@ fn apply_response(dev: &Arc<Mutex<DeviceRuntime>>, area: Area, start: u16, qty: 
         }
         g.import_registers(area, start, &words);
     }
-    true
+    Ok(())
 }
 
 /// 按点位类型拼写帧 PDU（FC05/06/10，TCP 与 RTU 主机共用）；
@@ -387,7 +412,9 @@ fn apply_write_response(
     Ok(())
 }
 
-/// 采集应答导入设备运行时（TCP 与 RTU 主机共用）
+/// 采集应答导入设备运行时（TCP 与 RTU 主机共用）。
+/// 超时/异常应答只计入采集统计（设备继续轮询）；IO 级错误先记原因再上抛
+/// （TCP：触发重连；RTU：串口保持、下一周期重试）。
 fn apply_poll_result(
     dev: &Arc<Mutex<DeviceRuntime>>,
     area: Area,
@@ -397,22 +424,22 @@ fn apply_poll_result(
 ) -> Result<(), String> {
     match result {
         Ok(resp) => {
-            let ok = apply_response(dev, area, start, qty, &resp);
+            let applied = apply_response(dev, area, start, qty, &resp);
             let mut g = dev.lock().unwrap();
-            if ok {
-                g.mark_ok();
-            } else {
-                g.mark_fail(); // 异常应答等
+            match applied {
+                Ok(()) => g.mark_ok(),
+                Err(reason) => g.mark_fail(&reason), // 异常应答等
             }
             Ok(())
         }
         Err(e) => {
+            let mut g = dev.lock().unwrap();
             if e == "超时" {
-                let mut g = dev.lock().unwrap();
                 g.mark_timeout();
-                g.mark_fail();
+                g.mark_fail("超时无应答");
                 Ok(())
             } else {
+                g.mark_fail(&e);
                 Err(e) // IO 级错误：交给上层
             }
         }
@@ -489,6 +516,8 @@ pub async fn serve_rtu_with(
     cancel: CancellationToken,
     mut rx: mpsc::Receiver<MasterMsg>,
 ) {
+    // 串口由启动阶段打开（失败即启动失败），进入主循环即视为链路已建立
+    ctx.manager.set_conn_state(ctx.conn_id, ConnStateKind::Connected, None);
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     // 取消令牌 → 置停止标志（唤醒阻塞读）
@@ -666,6 +695,14 @@ fn rtu_transact_retry(
             Err(e) => return Err(e),
         }
     }
+    // 重试全部超时：补一条超时标注事件（与 TCP 主机一致）
+    ctx.manager.emit_frame(FrameEvent::new(
+        ctx.conn_id,
+        find_device_id(ctx, unit),
+        "in",
+        &[],
+        Some("(超时无应答)".to_string()),
+    ));
     Err("超时".to_string())
 }
 

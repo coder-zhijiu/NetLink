@@ -202,3 +202,63 @@ async fn fault_exception_code_response() {
 
     mgr.stop_all();
 }
+
+/// 断连故障：收到请求后连接被立即关闭（读到 EOF），监听保持、可再次接入
+#[tokio::test(flavor = "multi_thread")]
+async fn fault_disconnect_closes_connection_and_reaccepts() {
+    let mgr = RuntimeManager::new();
+    mgr.start(&test_project(
+        15024,
+        FaultConfig {
+            kind: FaultKind::Disconnect,
+            delay_ms: None,
+            exception_code: None,
+        },
+    ))
+    .await
+    .unwrap();
+
+    // 两轮连接都应被断开（监听未随 socket 关闭而退出）
+    for round in 0..2u16 {
+        let mut s = connect_with_retry(15024).await;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(20 + round).to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&6u16.to_be_bytes());
+        frame.push(1);
+        frame.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x02]);
+        s.write_all(&frame).await.unwrap();
+
+        // 不应答、直接关闭：读到 EOF（0 字节）
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_millis(2000), s.read(&mut buf))
+            .await
+            .expect("关闭应立即发生")
+            .unwrap();
+        assert_eq!(n, 0, "断连故障应关闭连接（EOF）");
+    }
+
+    mgr.stop_all();
+}
+
+/// 脏帧故障在 TCP 上兜底：Modbus TCP 帧无校验和，按正常应答
+#[tokio::test(flavor = "multi_thread")]
+async fn fault_corrupt_on_tcp_falls_back_to_normal() {
+    let mgr = RuntimeManager::new();
+    mgr.start(&test_project(
+        15025,
+        FaultConfig {
+            kind: FaultKind::Corrupt,
+            delay_ms: None,
+            exception_code: None,
+        },
+    ))
+    .await
+    .unwrap();
+    let mut s = connect_with_retry(15025).await;
+
+    let resp = transact(&mut s, 1, 1, &[0x03, 0x00, 0x00, 0x00, 0x02]).await.unwrap();
+    assert_eq!(resp, vec![0x03, 0x04, 0x43, 0x7A, 0x00, 0x00]);
+
+    mgr.stop_all();
+}

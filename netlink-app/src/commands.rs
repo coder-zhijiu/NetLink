@@ -506,7 +506,8 @@ async fn ensure_runtime(app: &AppHandle, state: &AppState) -> RuntimeManager {
         }
     });
 
-    // 值推送：每 tick 快照选中设备（selected 为 Arc 共享，切换即时生效）
+    // 值推送：每 tick 快照选中设备（selected 为 Arc 共享，切换即时生效）；
+    // 采集统计与主机连接链路状态不依赖选中设备，每 tick 都带
     let push_manager = manager.clone();
     let selected = state.selected_device.clone();
     let app_values = app.clone();
@@ -516,31 +517,37 @@ async fn ensure_runtime(app: &AppHandle, state: &AppState) -> RuntimeManager {
         loop {
             ticker.tick().await;
             let dev = selected.load(Ordering::Acquire);
-            if dev == 0 {
-                continue;
+            let mut patch = Map::new();
+            if dev != 0 {
+                let values = push_manager.snapshot_values(dev);
+                if !values.is_empty() {
+                    let mut map = Map::new();
+                    for (id, v) in values {
+                        map.insert(id.to_string(), Value::from(v));
+                    }
+                    patch.insert("values".into(), Value::Object(map));
+                }
             }
-            let values = push_manager.snapshot_values(dev);
-            if values.is_empty() {
-                continue;
-            }
-            let mut map = Map::new();
-            for (id, v) in values {
-                map.insert(id.to_string(), Value::from(v));
-            }
-            let mut patch = json!({ "values": map, "running": push_manager.is_running() });
+            patch.insert("running".into(), json!(push_manager.is_running()));
             // 采集健康统计（主机设备）
             let stats = push_manager.snapshot_stats();
             if !stats.is_empty() {
                 let mut sm = Map::new();
-                for (id, last_ok, timeouts, fails) in stats {
+                for (id, last_ok, timeouts, fails, last_error) in stats {
                     sm.insert(
                         id.to_string(),
-                        json!({ "last_ok_ms": last_ok, "timeout_count": timeouts, "fail_count": fails }),
+                        json!({ "last_ok_ms": last_ok, "timeout_count": timeouts, "fail_count": fails, "last_error": last_error }),
                     );
                 }
-                patch["stats"] = Value::Object(sm);
+                patch.insert("stats".into(), Value::Object(sm));
             }
-            let _ = app_values.emit(UPDATE_EVENT, patch);
+            // 主机连接链路状态（替换式：连接停止后从快照消失）
+            let mut cm = Map::new();
+            for (id, kind, detail) in push_manager.snapshot_conn_states() {
+                cm.insert(id.to_string(), json!({ "kind": kind, "detail": detail }));
+            }
+            patch.insert("conn_states".into(), Value::Object(cm));
+            let _ = app_values.emit(UPDATE_EVENT, Value::Object(patch));
         }
     });
 

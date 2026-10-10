@@ -26,6 +26,10 @@ pub enum Reply {
     Delay { ms: u64, pdu: Vec<u8> },
     /// 立即应答
     Now(Vec<u8>),
+    /// 立即应答且内容正常，但传输层应破坏校验（故障注入：脏帧，CRC 仅存在于 RTU）
+    Corrupt(Vec<u8>),
+    /// 断开连接（故障注入：断连，仅 TCP 有连接概念）
+    Disconnect,
 }
 
 /// 按 unit id 找设备 id（帧事件标注用）
@@ -78,6 +82,11 @@ pub fn resolve(ctx: &ConnCtx, unit: u8, pdu: &[u8]) -> Option<Reply> {
             let code = fault.2.unwrap_or(0x01);
             Some(Reply::Now(vec![fc | 0x80, code]))
         }
+        FaultKind::Corrupt => {
+            let mut g = dev.lock().unwrap();
+            pdu::process_request(pdu, &mut g).map(Reply::Corrupt)
+        }
+        FaultKind::Disconnect => Some(Reply::Disconnect),
         FaultKind::Normal => {
             let mut g = dev.lock().unwrap();
             pdu::process_request(pdu, &mut g).map(Reply::Now)

@@ -2,7 +2,7 @@ import { computed, reactive } from 'vue'
 import { api } from './api'
 import { uiAlert, uiConfirm } from './ui-dialog'
 import { isMasterTransport } from './types'
-import type { Connection, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec } from './types'
+import type { Connection, ConnState, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec } from './types'
 import type { RuntimePatch } from './api/contract'
 
 const FRAME_LIMIT = 5000
@@ -18,6 +18,8 @@ export const store = reactive({
   values: {} as Record<number, number>,
   /** 主机侧采集健康统计（device_id → stat） */
   stats: {} as Record<number, DevStat>,
+  /** 主机连接链路状态（conn_id → 状态；替换式，连接停止后消失） */
+  connStates: {} as Record<number, ConnState>,
   paused: false,
   running: false,
   /** 逐连接运行状态（元素为运行中的连接 id） */
@@ -58,6 +60,7 @@ export function applyProjectHandle(h: ProjectHandle) {
   store.frames.length = 0
   store.values = {}
   store.stats = {}
+  store.connStates = {}
   store.running = false
   store.runningConns = []
   store.runningDevices = []
@@ -139,6 +142,7 @@ export function applyUpdate(patch: RuntimePatch) {
   if (patch.running !== undefined) store.running = patch.running
   if (patch.running_conns) store.runningConns = patch.running_conns
   if (patch.running_devices) store.runningDevices = patch.running_devices
+  if (patch.conn_states) store.connStates = patch.conn_states
   if (patch.paused !== undefined) store.paused = patch.paused
 }
 

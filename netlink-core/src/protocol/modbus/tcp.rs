@@ -100,6 +100,19 @@ async fn handle_socket(
                     pdu
                 }
                 Reply::Now(pdu) => pdu,
+                // 脏帧故障兜底：Modbus TCP 无校验和，按正常应答（UI 已按传输方式过滤）
+                Reply::Corrupt(pdu) => pdu,
+                // 断连故障：不应答，直接关闭该条连接（监听保持，主站可重连）
+                Reply::Disconnect => {
+                    ctx.manager.emit_frame(FrameEvent::new(
+                        ctx.conn_id,
+                        device_id,
+                        "out",
+                        &[],
+                        Some("(故障注入: 断开连接)".to_string()),
+                    ));
+                    return Ok(());
+                }
             };
 
             let mut out = Vec::with_capacity(MBAP_LEN + resp_pdu.len());

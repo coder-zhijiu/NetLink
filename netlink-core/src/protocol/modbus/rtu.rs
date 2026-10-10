@@ -110,8 +110,9 @@ fn run_serial(
     }
 }
 
-/// 处理一帧完整 RTU 报文；返回需要写回串口的应答字节（None = 不应答）
-fn handle_rtu_frame(ctx: &Arc<ConnCtx>, frame: &[u8]) -> Option<Vec<u8>> {
+/// 处理一帧完整 RTU 报文；返回需要写回串口的应答字节（None = 不应答）。
+/// 纯函数（IO 由 run_serial 承担），测试直接驱动。
+pub fn handle_rtu_frame(ctx: &Arc<ConnCtx>, frame: &[u8]) -> Option<Vec<u8>> {
     // 至少：地址 + 功能码 + CRC(2)
     if frame.len() < 4 {
         return None;
@@ -139,7 +140,7 @@ fn handle_rtu_frame(ctx: &Arc<ConnCtx>, frame: &[u8]) -> Option<Vec<u8>> {
         pdu_note(pdu),
     ));
 
-    let resp_pdu = match resolve(ctx, addr, pdu)? {
+    let (resp_pdu, corrupt) = match resolve(ctx, addr, pdu)? {
         Reply::Drop => {
             ctx.manager.emit_frame(FrameEvent::new(
                 ctx.conn_id,
@@ -152,23 +153,43 @@ fn handle_rtu_frame(ctx: &Arc<ConnCtx>, frame: &[u8]) -> Option<Vec<u8>> {
         }
         Reply::Delay { ms, pdu } => {
             std::thread::sleep(Duration::from_millis(ms));
-            pdu
+            (pdu, false)
         }
-        Reply::Now(pdu) => pdu,
+        Reply::Now(pdu) => (pdu, false),
+        // 脏帧故障：PDU 内容正常，CRC 翻转一位保证校验必失败
+        Reply::Corrupt(pdu) => (pdu, true),
+        // 断连故障兜底：串口无连接概念，按不应答处理（UI 已按传输方式过滤）
+        Reply::Disconnect => {
+            ctx.manager.emit_frame(FrameEvent::new(
+                ctx.conn_id,
+                find_device_id(ctx, addr),
+                "out",
+                &[],
+                Some("(断连: 串口无连接概念)".to_string()),
+            ));
+            return None;
+        }
     };
 
     let mut out = Vec::with_capacity(3 + resp_pdu.len());
     out.push(addr);
     out.extend_from_slice(&resp_pdu);
-    let crc = crc16(&out).to_le_bytes();
-    out.extend_from_slice(&crc);
+    let crc = crc16(&out) ^ if corrupt { 1 } else { 0 };
+    out.extend_from_slice(&crc.to_le_bytes());
 
+    let mut note = pdu_note_resp(&resp_pdu);
+    if corrupt {
+        note = Some(match note {
+            Some(s) => format!("{s} (故障注入: CRC 已破坏)"),
+            None => "(故障注入: CRC 已破坏)".to_string(),
+        });
+    }
     ctx.manager.emit_frame(FrameEvent::new(
         ctx.conn_id,
         find_device_id(ctx, addr),
         "out",
         &out,
-        pdu_note_resp(&resp_pdu),
+        note,
     ));
 
     Some(out)

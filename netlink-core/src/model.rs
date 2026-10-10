@@ -160,6 +160,10 @@ pub enum FaultKind {
     Timeout,
     Delay,
     Exception,
+    /// 脏帧：应答 CRC 故意破坏（仅 RTU 有意义；TCP 无校验和，按正常应答兜底）
+    Corrupt,
+    /// 断连：收到请求后关闭 TCP 连接（仅 TCP 有意义；串口无连接概念，按不应答兜底）
+    Disconnect,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

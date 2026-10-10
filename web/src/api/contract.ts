@@ -1,4 +1,4 @@
-import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, DevStat, Transport, TestConnResult } from '../types'
+import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, ConnState, DevStat, Transport, TestConnResult } from '../types'
 
 /** 运行时状态推送（mock 与 tauri 两种实现共用） */
 export interface RuntimePatch {
@@ -11,6 +11,8 @@ export interface RuntimePatch {
   running_conns?: number[]
   /** 在线设备 id 列表（运行态，与工程配置的 enabled 解耦） */
   running_devices?: number[]
+  /** 主机连接链路状态（连接 id → 状态，替换式：连接停止后从推送中消失） */
+  conn_states?: Record<number, ConnState>
   paused?: boolean
 }
 

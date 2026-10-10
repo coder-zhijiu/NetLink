@@ -7,6 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use serde::Serialize;
+
 use crate::model::{Area, Connection, DataType, Device, FaultConfig, ProjectSpec, Transport, ValueSource};
 use crate::protocol::FrameEvent;
 use crate::protocol::modbus::master::{self, MasterMsg};
@@ -90,6 +92,8 @@ pub struct DeviceRuntime {
     pub last_ok_ms: u64,
     pub timeout_count: u64,
     pub fail_count: u64,
+    /// 最近一次采集失败原因（成功采集后清空；仅主机侧维护）
+    pub last_error: Option<String>,
     points: Vec<PointRuntime>,
     values: Vec<f64>,
     blocks: Blocks,
@@ -189,6 +193,7 @@ impl DeviceRuntime {
             last_ok_ms: 0,
             timeout_count: 0,
             fail_count: 0,
+            last_error: None,
             points,
             values: dev
                 .points
@@ -417,14 +422,18 @@ impl DeviceRuntime {
     /// 本轮采集成功
     pub fn mark_ok(&mut self) {
         self.last_ok_ms = now_ms();
+        self.last_error = None;
     }
 
     pub fn mark_timeout(&mut self) {
         self.timeout_count += 1;
+        self.last_error = Some("超时无应答".to_string());
     }
 
-    pub fn mark_fail(&mut self) {
+    /// 采集失败：计数并记录原因（悬浮提示展示）
+    pub fn mark_fail(&mut self, reason: &str) {
         self.fail_count += 1;
+        self.last_error = Some(reason.to_string());
     }
 }
 
@@ -497,6 +506,26 @@ struct ConnState {
     cmd_tx: Option<mpsc::Sender<MasterMsg>>,
 }
 
+/// 主机连接的链路状态（仅主机类连接维护；从机监听不适用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnStateKind {
+    /// 首次连接中
+    Connecting,
+    /// 已建立（正常采集）
+    Connected,
+    /// 断开后重连中（含退避等待）
+    Reconnecting,
+}
+
+/// 一条主机连接的当前链路状态
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnStatus {
+    pub kind: ConnStateKind,
+    /// 断开原因等细节（前端悬浮提示展示）
+    pub detail: Option<String>,
+}
+
 /// 运行时总管理器：跨连接共享仿真时钟与帧广播。
 /// Clone 后内部共享同一状态。
 #[derive(Clone)]
@@ -508,6 +537,8 @@ struct RuntimeInner {
     clock: SimClock,
     frame_tx: broadcast::Sender<FrameEvent>,
     conns: Mutex<HashMap<u64, ConnState>>,
+    /// 主机连接链路状态（conn_id → 状态；连接停止时清除）
+    conn_states: Mutex<HashMap<u64, ConnStatus>>,
     frame_seq: std::sync::atomic::AtomicU64,
 }
 
@@ -519,6 +550,7 @@ impl RuntimeManager {
                 clock: SimClock::new(),
                 frame_tx,
                 conns: Mutex::new(HashMap::new()),
+                conn_states: Mutex::new(HashMap::new()),
                 frame_seq: std::sync::atomic::AtomicU64::new(1),
             }),
         }
@@ -700,6 +732,7 @@ impl RuntimeManager {
 
     /// 停止单条连接；返回该连接此前是否在运行
     pub fn stop_connection(&self, id: u64) -> bool {
+        self.inner.conn_states.lock().unwrap().remove(&id);
         if let Some(state) = self.inner.conns.lock().unwrap().remove(&id) {
             state.cancel.cancel();
             for t in state.tasks {
@@ -769,17 +802,37 @@ impl RuntimeManager {
         Vec::new()
     }
 
-    /// 全部设备的采集健康统计：(device_id, last_ok_ms, timeout_count, fail_count)
-    pub fn snapshot_stats(&self) -> Vec<(u64, u64, u64, u64)> {
+    /// 全部设备的采集健康统计：(device_id, last_ok_ms, timeout_count, fail_count, last_error)
+    pub fn snapshot_stats(&self) -> Vec<(u64, u64, u64, u64, Option<String>)> {
         let conns = self.inner.conns.lock().unwrap();
         let mut out = Vec::new();
         for state in conns.values() {
             for dev in &state.devices {
                 let d = dev.lock().unwrap();
-                out.push((d.id, d.last_ok_ms, d.timeout_count, d.fail_count));
+                out.push((d.id, d.last_ok_ms, d.timeout_count, d.fail_count, d.last_error.clone()));
             }
         }
         out
+    }
+
+    /// 设置主机连接链路状态（仅主机类连接调用；从机监听不适用）
+    pub fn set_conn_state(&self, conn_id: u64, kind: ConnStateKind, detail: Option<String>) {
+        self.inner
+            .conn_states
+            .lock()
+            .unwrap()
+            .insert(conn_id, ConnStatus { kind, detail });
+    }
+
+    /// 主机连接链路状态快照：(conn_id, kind, detail)；停止的连接不出现
+    pub fn snapshot_conn_states(&self) -> Vec<(u64, ConnStateKind, Option<String>)> {
+        self.inner
+            .conn_states
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, s)| (*id, s.kind, s.detail.clone()))
+            .collect()
     }
 
     /// 主机侧写点位：按点位类型自动拼 FC05/06/10 下发到所属主机连接
