@@ -61,6 +61,7 @@ export function currentFileName(): string | null {
 
 /** 应用一个工程句柄：替换当前工程，重置运行视图（旧连接/设备 id 已失效） */
 export function applyProjectHandle(h: ProjectHandle) {
+  sanitizeIds(h.spec)
   store.project = h.spec
   store.currentPath = h.path
   savedSnapshot = JSON.stringify(h.spec)
@@ -84,6 +85,51 @@ function firstSelectableId(p: ProjectSpec): number | null {
     if (dev != null) return dev
   }
   return null
+}
+
+/** 加载时修复工程文件里的重复 id（历史版本发号器重启重置造成的撞号）：
+ *  重复的连接 id 会让按 id 查找（addDevice/启停/后端 startConn）命中靠前的连接。
+ *  运行态映射（选中/统计/帧）随后整体重置，改号无副作用；下次保存即落盘。 */
+function sanitizeIds(spec: ProjectSpec): void {
+  // 连接 id
+  {
+    const seen = new Set<number>()
+    let next = Math.max(100000 - 1, ...spec.connections.map((c) => c.id)) + 1
+    for (const c of spec.connections) {
+      if (seen.has(c.id)) c.id = next++
+      else seen.add(c.id)
+    }
+  }
+  // 设备 / CAN 节点 id（共用空间）
+  {
+    const objects = spec.connections.flatMap((c) => [...c.devices, ...(c.can_nodes ?? [])])
+    const seen = new Set<number>()
+    let next = Math.max(200000 - 1, ...objects.map((o) => o.id)) + 1
+    for (const o of objects) {
+      if (seen.has(o.id)) o.id = next++
+      else seen.add(o.id)
+    }
+  }
+  // 点位 id（全工程唯一）
+  {
+    const points = spec.connections.flatMap((c) => c.devices.flatMap((d) => d.points))
+    const seen = new Set<number>()
+    let next = Math.max(100000 - 1, ...points.map((p) => p.id)) + 1
+    for (const p of points) {
+      if (seen.has(p.id)) p.id = next++
+      else seen.add(p.id)
+    }
+  }
+  // CAN 报文 id（全工程唯一）
+  {
+    const frames = spec.connections.flatMap((c) => (c.can_nodes ?? []).flatMap((n) => n.frames))
+    const seen = new Set<number>()
+    let next = Math.max(400000 - 1, ...frames.map((f) => f.id)) + 1
+    for (const f of frames) {
+      if (seen.has(f.id)) f.id = next++
+      else seen.add(f.id)
+    }
+  }
 }
 
 /** 刷新工程目录列表（失败不阻塞：列表为空仍可编辑当前工程） */
@@ -328,19 +374,25 @@ export function removePoint(deviceId: number, pointId: number) {
   if (idx >= 0) dev.points.splice(idx, 1)
 }
 
-let pointSeq = 100000
-export function nextPointId() {
-  return pointSeq++
+// ---------- id 发号 ----------
+// 发号取「当前工程同 id 空间的最大值 + 1」而非模块级计数器：计数器初值写死，
+// 应用重启后重置，会与上个会话存盘的对象撞号（曾导致新建设备落到同 id 的旧连接下）。
+// 各调用点都是「发号后立即入树」，下一次发号能看到刚分配的 id，不会连号。
+
+/** 点位 id（全工程唯一） */
+export function nextPointId(): number {
+  const pts = (store.project?.connections ?? []).flatMap((c) => c.devices.flatMap((d) => d.points))
+  return 1 + pts.reduce((m, p) => Math.max(m, p.id), 100000 - 1)
 }
 
-let connSeq = 100000
-export function nextConnId() {
-  return connSeq++
+/** 连接 id */
+export function nextConnId(): number {
+  return 1 + (store.project?.connections ?? []).reduce((m, c) => Math.max(m, c.id), 100000 - 1)
 }
 
-let devSeq = 200000
-export function nextDevId() {
-  return devSeq++
+/** 设备 id（设备与 CAN 节点共用选中/在线 id 空间，两边都参与取最大值） */
+export function nextDevId(): number {
+  return 1 + allSelectableObjects().reduce((m, o) => Math.max(m, o.id), 200000 - 1)
 }
 
 /** 全部连接的扁平设备列表 */
@@ -397,14 +449,23 @@ export function removeDevice(deviceId: number) {
 
 // ---------- CAN 节点 / 周期报文 CRUD ----------
 
-let nodeSeq = 300000
-export function nextNodeId() {
-  return nodeSeq++
+/** CAN 节点 id（与设备共用 id 空间） */
+export function nextNodeId(): number {
+  return 1 + allSelectableObjects().reduce((m, o) => Math.max(m, o.id), 300000 - 1)
 }
 
-let frameSeq = 400000
-export function nextFrameId() {
-  return frameSeq++
+/** CAN 周期报文 id（全工程唯一） */
+export function nextFrameId(): number {
+  const frs = (store.project?.connections ?? []).flatMap((c) => (c.can_nodes ?? []).flatMap((n) => n.frames))
+  return 1 + frs.reduce((m, f) => Math.max(f.id, m), 400000 - 1)
+}
+
+/** 设备 + CAN 节点（共用 id 空间的全部对象） */
+function allSelectableObjects(): Array<{ id: number }> {
+  return (store.project?.connections ?? []).flatMap((c) => [
+    ...c.devices,
+    ...(c.can_nodes ?? []),
+  ])
 }
 
 export function addCanNode(connId: number, node: CanNode) {
