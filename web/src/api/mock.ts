@@ -1,5 +1,5 @@
 import type { NetLinkApi, RuntimePatch } from './contract'
-import type { CanAgg, CanFrame, CanRxStat, FrameRecord, ProjectHandle, ProjectMeta, ProjectSpec, Point, PointRow, SheetParseResult, SourceKind, DevStat, Transport, TestConnResult } from '../types'
+import type { Area, CanAgg, CanFrame, CanRxStat, DataType, Device, FrameRecord, Point, ProjectHandle, ProjectMeta, ProjectSpec, PointRow, ScanParams, ScanProgress, ScanRange, ScanResult, SheetParseResult, SourceKind, DevStat, Transport, TestConnResult } from '../types'
 import { canFrameNote, isCanTransport, isMasterTransport } from '../types'
 import { parseCsvText, writeCsvText } from './point-sheet-csv'
 
@@ -407,6 +407,173 @@ export function createMockApi(): NetLinkApi {
     note,
   })
 
+  // ---------- mock 点位扫描（对齐 Rust scan 引擎的可观测行为） ----------
+
+  /** 进行中的 mock 扫描（取消句柄） */
+  const activeScans = new Map<number, { cancelled: boolean }>()
+
+  /** 与 Rust runtime::encode_words 同构（u64/i64 演示工程不用，按 f64 位型兜底） */
+  const encodeWords = (v: number, dt: DataType): number[] => {
+    switch (dt) {
+      case 'u16':
+        return [Math.max(0, Math.min(65535, Math.round(v)))]
+      case 'i16':
+        return [new Uint16Array(new Int16Array([Math.max(-32768, Math.min(32767, Math.round(v)))]).buffer)[0]]
+      case 'u32': {
+        const x = Math.max(0, Math.min(4294967295, Math.round(v)))
+        return [x >>> 16, x & 0xffff]
+      }
+      case 'i32': {
+        const u = new Uint32Array(new Int32Array([Math.max(-2147483648, Math.min(2147483647, Math.round(v)))]).buffer)[0]
+        return [u >>> 16, u & 0xffff]
+      }
+      case 'f32': {
+        const b = new ArrayBuffer(4)
+        new DataView(b).setFloat32(0, v)
+        const dv = new DataView(b)
+        return [dv.getUint16(0), dv.getUint16(2)]
+      }
+      default: {
+        const b = new ArrayBuffer(8)
+        new DataView(b).setFloat64(0, v)
+        const dv = new DataView(b)
+        return [dv.getUint16(0), dv.getUint16(2), dv.getUint16(4), dv.getUint16(6)]
+      }
+    }
+  }
+
+  const wordsOf = (dt: DataType): number => (dt === 'u16' || dt === 'i16' ? 1 : dt === 'u32' || dt === 'i32' || dt === 'f32' ? 2 : 4)
+
+  /** 镜像从机（同工程里运行中的从机设备，按 slave_id 匹配——与 tickMaster 同款配对） */
+  const findMirrorSlave = (unit: number): Device | null => {
+    const slaves = (project?.connections ?? [])
+      .filter((c) => (c.transport.kind === 'tcp_server' || c.transport.kind === 'serial') && runningConns.has(c.id))
+      .flatMap((c) => c.devices)
+      .filter((d) => runningDevices.has(d.id))
+    return slaves.find((s) => s.slave_id === unit) ?? null
+  }
+
+  /** 由镜像从机的点表推导可读区间（连续槽位合并；限扫描范围内），值取当前仿真值编码 */
+  const mirrorRanges = (mirror: Device, params: ScanParams): ScanRange[] => {
+    const out: ScanRange[] = []
+    const order: Area[] = ['coil', 'discrete_input', 'holding_register', 'input_register']
+    for (const area of order) {
+      if (!params.areas.includes(area)) continue
+      const pts = mirror.points.filter((p) => p.area === area).slice().sort((a, b) => a.address - b.address)
+      for (const p of pts) {
+        const slots = area === 'coil' || area === 'discrete_input' ? 1 : wordsOf(p.data_type)
+        const from = Math.max(p.address, params.start_addr)
+        const to = Math.min(p.address + slots - 1, params.end_addr)
+        if (from > to) continue
+        // 逐槽位取值：位区按点值 0/1；字区按数据类型编码（跨点重叠取先到的）
+        const vals: number[] = []
+        for (let a = from; a <= to; a++) {
+          if (area === 'coil' || area === 'discrete_input') {
+            vals.push((values.get(p.id) ?? 0) >= 0.5 ? 1 : 0)
+          } else {
+            const ws = encodeWords(values.get(p.id) ?? 0, p.data_type)
+            vals.push(ws[a - p.address] ?? 0)
+          }
+        }
+        const last = out[out.length - 1]
+        if (last && last.area === area && last.start + last.qty === from) {
+          last.qty += to - from + 1
+          last.values.push(...vals)
+        } else {
+          out.push({ area, start: from, qty: to - from + 1, values: vals })
+        }
+      }
+    }
+    return out
+  }
+
+  const scanFramePair = (connId: number, unit: number, fc: number, addr: number, qty: number, ok: boolean): FrameRecord[] => {
+    const req = [fc, (addr >> 8) & 0xff, addr & 0xff, (qty >> 8) & 0xff, qty & 0xff]
+    const fcName: Record<number, string> = { 1: '读线圈', 2: '读离散输入', 3: '读保持寄存器', 4: '读输入寄存器' }
+    const resp = ok
+      ? [fc, Math.min(250, qty * 2), ...Array.from({ length: Math.min(16, qty * 2) }, (_, i) => (i * 37 + 11) & 0xff)]
+      : [fc | 0x80, 0x02]
+    return [
+      { ...makeFrame('out', connId, undefined, req, `扫描 FC${hex(fc)} ${fcName[fc] ?? ''} addr=${addr} qty=${qty}`), scan: true },
+      { ...makeFrame('in', connId, undefined, resp, ok ? '扫描应答' : '扫描应答 异常02'), scan: true },
+    ]
+  }
+
+  const scanPoints = (connId: number, params: ScanParams): Promise<ScanResult> => {
+    const conn = project?.connections.find((c) => c.id === connId)
+    if (!conn) return Promise.reject(new Error('连接不存在'))
+    if (!isMasterTransport(conn.transport.kind)) return Promise.reject(new Error('该连接不是主机连接'))
+    if (!runningConns.has(connId)) return Promise.reject(new Error('主机连接未启动，无法扫描'))
+    const areas = params.areas
+    const start = params.start_addr
+    const end = Math.max(params.start_addr, params.end_addr)
+    const total = Math.max(1, areas.length * (end - start + 1))
+    const mirror = findMirrorSlave(params.unit)
+
+    return new Promise<ScanResult>((resolve) => {
+      const state = { cancelled: false }
+      activeScans.set(connId, state)
+      const result: ScanResult = { ranges: [], suspicious: [], rejected: [], aborted: null }
+      const stepMs = 170
+      const steps = 14
+      let processed = 0
+
+      const progressPatch = (extra: Partial<ScanProgress>) => {
+        const p: ScanProgress = {
+          conn_id: connId,
+          unit: params.unit,
+          area: areas[Math.min(areas.length - 1, Math.floor((processed / total) * areas.length))] ?? null,
+          cur_addr: Math.min(65535, start + Math.round(((end - start) * processed) / total)),
+          processed,
+          total,
+          ranges: result.ranges.length,
+          suspicious: 0,
+          done: false,
+          aborted: null,
+          ...extra,
+        }
+        emit({ scan: { [connId]: p } })
+      }
+
+      const finish = (r: ScanResult) => {
+        activeScans.delete(connId)
+        progressPatch({ done: true, processed: total, aborted: r.aborted, ranges: r.ranges.length })
+        emit({ scan: {} }) // 与 tauri 端一致：扫描结束 = 空表
+        resolve(r)
+      }
+
+      if (!mirror) {
+        // 演示模式找不到镜像从机：模拟探活失败 → 快速中止
+        progressPatch({})
+        setTimeout(() => {
+          emit({ frames: scanFramePair(connId, params.unit, 3, start, 125, false).slice(0, 1) })
+          setTimeout(() => {
+            result.aborted = '从机无应答（演示模式：同工程里找不到运行中的镜像从机设备）'
+            finish(result)
+          }, stepMs)
+        }, stepMs)
+        return
+      }
+
+      result.ranges = mirrorRanges(mirror, params)
+      const timer = setInterval(() => {
+        if (state.cancelled) {
+          result.aborted = '已取消'
+          finish(result)
+          return
+        }
+        processed = Math.min(total, processed + Math.ceil(total / steps))
+        const fc = 3
+        emit({ frames: scanFramePair(connId, params.unit, fc, start + Math.round(((end - start) * processed) / total), 125, true) })
+        progressPatch({})
+        if (processed >= total) {
+          clearInterval(timer)
+          finish(result)
+        }
+      }, stepMs)
+    })
+  }
+
   const tickFrames = () => {
     if (!running() || paused) return
     const frames: FrameRecord[] = []
@@ -670,6 +837,12 @@ export function createMockApi(): NetLinkApi {
       canAgg.set(connId, agg)
       emit({ frames: [canFrameRec('out', connId, undefined, frame)] })
       emit({ can_rx: { [connId]: canAggSnapshot(agg) } })
+    },
+    scanPoints,
+    async scanCancel(connId) {
+      const state = activeScans.get(connId)
+      if (!state) throw new Error('该连接没有进行中的扫描')
+      state.cancelled = true
     },
     onUpdate(cb) {
       listeners.add(cb)

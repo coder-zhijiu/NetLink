@@ -547,6 +547,12 @@ async fn ensure_runtime(app: &AppHandle, state: &AppState) -> RuntimeManager {
                 cm.insert(id.to_string(), json!({ "kind": kind, "detail": detail }));
             }
             patch.insert("conn_states".into(), Value::Object(cm));
+            // 点位扫描进度（替换式：与 conn_states 一致恒插入，扫描结束 = 空表）
+            let mut sm = Map::new();
+            for (id, p) in push_manager.snapshot_scan_progress() {
+                sm.insert(id.to_string(), json!(p));
+            }
+            patch.insert("scan".into(), Value::Object(sm));
             // CAN 连接观测（接收聚合 + 帧率；替换式，非 CAN 连接不出现）
             let can = push_manager.snapshot_can_rx();
             if !can.is_empty() {
@@ -704,6 +710,28 @@ pub async fn send_test_frame(
         None => return Err("模拟未启动".to_string()),
     };
     Ok(netlink_core::protocol::hex_str(&resp))
+}
+
+/// 主机侧点位扫描（长任务，可能数分钟）：进度经 netlink://update 的 scan 字段推送，
+/// 结束后返回完整结果（取消/中止也返回部分结果）。
+/// manager 克隆后释放锁再等待——扫描期间不能占住 state.manager 饿死其他命令
+#[tauri::command]
+pub async fn scan_points(
+    state: State<'_, AppState>,
+    conn_id: u64,
+    params: netlink_core::protocol::modbus::scan::ScanParams,
+) -> Result<netlink_core::protocol::modbus::scan::ScanResult, String> {
+    let manager = state.manager.lock().await.clone();
+    let m = manager.ok_or_else(|| "模拟未启动".to_string())?;
+    m.scan_points(conn_id, params).await
+}
+
+/// 取消进行中的点位扫描
+#[tauri::command]
+pub async fn scan_cancel(state: State<'_, AppState>, conn_id: u64) -> Result<(), String> {
+    let manager = state.manager.lock().await.clone();
+    let m = manager.ok_or_else(|| "模拟未启动".to_string())?;
+    m.scan_cancel(conn_id)
 }
 
 /// CAN 手动发送一帧（连接编辑器/发送面板；帧结构字段与前端 snake_case 对齐）

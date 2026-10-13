@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog'
 import type { NetLinkApi, RuntimePatch } from './contract'
-import type { ProjectHandle, ProjectMeta, ProjectSpec, PointRow, SheetParseResult, TestConnResult } from '../types'
+import type { ProjectHandle, ProjectMeta, ProjectSpec, PointRow, ScanParams, ScanResult, SheetParseResult, TestConnResult } from '../types'
 
 /** Tauri 模式：所有操作走 netlink-app 的 commands，运行时状态经 netlink://update 事件推送 */
 export function createTauriApi(): NetLinkApi {
@@ -68,6 +68,13 @@ export function createTauriApi(): NetLinkApi {
     },
     async sendTestFrame(connId, unit, hex) {
       return await invoke<string>('send_test_frame', { connId, unit, hex })
+    },
+    async scanPoints(connId: number, params: ScanParams): Promise<ScanResult> {
+      // params 为嵌套对象：字段名按 Rust serde（snake_case），顶层命令参数才走 camelCase
+      return await invoke<ScanResult>('scan_points', { connId, params })
+    },
+    async scanCancel(connId: number) {
+      await invoke('scan_cancel', { connId })
     },
     async sendCanFrame(connId, frame) {
       // 帧结构字段与 Rust 端 CanFrame（snake_case）对齐，参数名走 camelCase

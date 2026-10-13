@@ -1,11 +1,13 @@
 //! Modbus 主机：TCP 轮询采集客户端 + RTU 串口轮询（`serve_serial`）。
 //!
 //! TCP 结构：连接循环（断线退避重连 1s→5s→30s 封顶）→ 轮询调度器
-//! （单连接串行：到期设备逐个采集；写点/测试帧命令插队处理）。
+//! （单连接串行：到期设备逐个采集；写点/测试帧/扫描命令插队处理）。
 //! RTU 结构：独占串口阻塞线程（同 RTU 从机），帧格式 `[地址][PDU][CRC16]`，
 //! 以读超时静默间隙判定帧边界；命令通道复用 MasterMsg。
 //! 采集应答经 `import_registers/import_bits` 写回设备运行时，
 //! 复用从机侧的值推送与报文监视链路（dir 语义反转：out=请求 / in=应答）。
+//! 点位扫描（scan 模块的 ScanEngine 状态机）在两条管道上以同构驱动循环执行：
+//! 扫描期间轮询天然让路（同一串行调度链）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +18,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::scan::{ScanEngine, ScanParams, ScanProgress, ScanResult};
 use super::tcp::{pdu_note, pdu_note_resp};
 use super::{find_device_id, ConnCtx};
 use crate::model::Area;
@@ -37,6 +40,14 @@ pub enum MasterMsg {
         unit: u8,
         pdu: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// 点位扫描：对 unit 暴力探测可读地址（长任务，进度实时写入 progress）
+    Scan {
+        params: ScanParams,
+        /// 用户取消（面板「停止」按钮）
+        cancel: CancellationToken,
+        progress: Arc<Mutex<ScanProgress>>,
+        reply: oneshot::Sender<ScanResult>,
     },
 }
 
@@ -148,7 +159,7 @@ struct Dispatcher {
 }
 
 impl Dispatcher {
-    /// 一条请求-应答事务（带超时与重试）；返回应答 PDU
+    /// 一条请求-应答事务（1 次 + 2 次重试，非扫描帧）；返回应答 PDU
     async fn transact(
         &mut self,
         stream: &mut TcpStream,
@@ -157,8 +168,23 @@ impl Dispatcher {
         pdu: &[u8],
         timeout_ms: u32,
     ) -> Result<Vec<u8>, String> {
+        self.transact_with(stream, ctx, unit, pdu, timeout_ms, ATTEMPTS, false).await
+    }
+
+    /// 同上，参数化尝试次数与扫描标记（扫描事务不重试/探活自带重试，帧带 scan 标志）
+    async fn transact_with(
+        &mut self,
+        stream: &mut TcpStream,
+        ctx: &ConnCtx,
+        unit: u8,
+        pdu: &[u8],
+        timeout_ms: u32,
+        attempts: usize,
+        scan: bool,
+    ) -> Result<Vec<u8>, String> {
         let timeout = Duration::from_millis(timeout_ms.max(50) as u64);
-        for _ in 0..ATTEMPTS {
+        let dev_id = find_device_id(ctx, unit);
+        for _ in 0..attempts.max(1) {
             self.txn = self.txn.wrapping_add(1);
             let txn = self.txn;
             let mut frame = Vec::with_capacity(MBAP_LEN + pdu.len());
@@ -168,25 +194,18 @@ impl Dispatcher {
             frame.push(unit);
             frame.extend_from_slice(pdu);
 
-            ctx.manager.emit_frame(FrameEvent::new(
-                ctx.conn_id,
-                find_device_id(ctx, unit),
-                "out",
-                &frame,
-                pdu_note(pdu),
-            ));
+            let mut ev = FrameEvent::new(ctx.conn_id, dev_id, "out", &frame, pdu_note(pdu));
+            ev.scan = scan;
+            ctx.manager.emit_frame(ev);
             stream.write_all(&frame).await.map_err(|e| format!("写入失败: {e}"))?;
 
             let read = read_response(stream, txn);
             match tokio::time::timeout(timeout, read).await {
                 Ok(Ok(pdu_resp)) => {
-                    ctx.manager.emit_frame(FrameEvent::new(
-                        ctx.conn_id,
-                        find_device_id(ctx, unit),
-                        "in",
-                        &pdu_resp.1,
-                        pdu_note_resp(&pdu_resp.0),
-                    ));
+                    let mut ev =
+                        FrameEvent::new(ctx.conn_id, dev_id, "in", &pdu_resp.1, pdu_note_resp(&pdu_resp.0));
+                    ev.scan = scan;
+                    ctx.manager.emit_frame(ev);
                     return Ok(pdu_resp.0);
                 }
                 Ok(Err(e)) => return Err(e), // IO 错误：交给上层重连
@@ -197,13 +216,15 @@ impl Dispatcher {
             }
         }
         // 重试全部超时：补一条超时标注事件（与从机侧「(超时不响应)」对称）
-        ctx.manager.emit_frame(FrameEvent::new(
+        let mut ev = FrameEvent::new(
             ctx.conn_id,
-            find_device_id(ctx, unit),
+            dev_id,
             "in",
             &[],
             Some("(超时无应答)".to_string()),
-        ));
+        );
+        ev.scan = scan;
+        ctx.manager.emit_frame(ev);
         Err("超时".to_string())
     }
 }
@@ -280,6 +301,12 @@ async fn dispatch(
                         let r = d.transact(stream, ctx, unit, &pdu, timeout_ms).await;
                         let _ = reply.send(r);
                     }
+                    Some(MasterMsg::Scan { params, cancel: scan_cancel, progress, reply }) => {
+                        // 扫描期间轮询天然暂停（本 arm 阻塞到扫描结束）；
+                        // 连接级取消/链路 IO 错误由驱动循环检测并中止扫描
+                        let r = run_scan_tcp(stream, ctx, &params, &progress, &scan_cancel, cancel, timeout_ms, &mut d).await;
+                        let _ = reply.send(r);
+                    }
                     None => {
                         // 通道关闭（连接停止中）：等取消
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -289,6 +316,41 @@ async fn dispatch(
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next)) => {}
         }
     }
+}
+
+/// 扫描驱动（TCP）：执行 ScanEngine 产出的每笔读事务。
+/// 连接取消/链路错误 → 引擎中止并保留部分结果；IO 级错误不再上抛
+/// （连接本身的断线重连由后续轮询触发，扫描侧只负责干净收尾）
+async fn run_scan_tcp(
+    stream: &mut TcpStream,
+    ctx: &Arc<ConnCtx>,
+    params: &ScanParams,
+    progress: &Arc<Mutex<ScanProgress>>,
+    scan_cancel: &CancellationToken,
+    conn_cancel: &CancellationToken,
+    timeout_ms: u32,
+    d: &mut Dispatcher,
+) -> ScanResult {
+    let mut eng = ScanEngine::new(params, ctx.conn_id, progress.clone(), scan_cancel.clone());
+    while let Some(req) = eng.next_request() {
+        if conn_cancel.is_cancelled() {
+            eng.abort("连接已停止");
+            break;
+        }
+        let pdu = read_pdu(req.fc, req.addr, req.qty);
+        let r = d.transact_with(stream, ctx, params.unit, &pdu, timeout_ms, req.attempts, true).await;
+        eng.apply(r);
+    }
+    eng.into_result()
+}
+
+/// 拼读请求 PDU：[fc][起始地址 2B][数量 2B]
+fn read_pdu(fc: u8, addr: u16, qty: u16) -> Vec<u8> {
+    let mut pdu = Vec::with_capacity(5);
+    pdu.push(fc);
+    pdu.extend_from_slice(&addr.to_be_bytes());
+    pdu.extend_from_slice(&qty.to_be_bytes());
+    pdu
 }
 
 /// 采集一台设备：分段请求 → 应答导入
@@ -569,7 +631,7 @@ fn rtu_master_loop(
             }
         }
 
-        // 写点/测试帧命令插队（非阻塞收取）
+        // 写点/测试帧/扫描命令插队（非阻塞收取）
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 MasterMsg::Write { device, point_id, value, reply } => {
@@ -577,7 +639,12 @@ fn rtu_master_loop(
                     let _ = reply.send(r);
                 }
                 MasterMsg::TestFrame { unit, pdu, reply } => {
-                    let r = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms).map(|(p, _)| p);
+                    let r = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms, ATTEMPTS, false).map(|(p, _)| p);
+                    let _ = reply.send(r);
+                }
+                MasterMsg::Scan { params, cancel: scan_cancel, progress, reply } => {
+                    // 扫描期间轮询天然暂停（本分支阻塞到扫描结束）
+                    let r = run_scan_rtu(io, ctx, &params, &progress, &scan_cancel, stop_flag, timeout_ms);
                     let _ = reply.send(r);
                 }
             }
@@ -600,13 +667,15 @@ fn rtu_drain(io: &mut dyn RtuIo) {
     }
 }
 
-/// 单次 RTU 事务：发 `[addr][pdu][crc]`，以帧间隔收一帧并校验；返回 (应答 PDU, 完整帧)
+/// 单次 RTU 事务：发 `[addr][pdu][crc]`，以帧间隔收一帧并校验；返回 (应答 PDU, 完整帧)。
+/// scan = 点位扫描事务（帧事件带 scan 标志，监视器默认隐藏）
 fn rtu_transact(
     io: &mut dyn RtuIo,
     ctx: &ConnCtx,
     unit: u8,
     pdu: &[u8],
     timeout_ms: u32,
+    scan: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut frame = Vec::with_capacity(3 + pdu.len());
     frame.push(unit);
@@ -614,13 +683,10 @@ fn rtu_transact(
     let crc = super::rtu::crc16(&frame);
     frame.extend_from_slice(&crc.to_le_bytes());
 
-    ctx.manager.emit_frame(FrameEvent::new(
-        ctx.conn_id,
-        find_device_id(ctx, unit),
-        "out",
-        &frame,
-        pdu_note(pdu),
-    ));
+    let dev_id = find_device_id(ctx, unit);
+    let mut ev = FrameEvent::new(ctx.conn_id, dev_id, "out", &frame, pdu_note(pdu));
+    ev.scan = scan;
+    ctx.manager.emit_frame(ev);
     io.write_all(&frame).map_err(|e| format!("串口写入失败: {e}"))?;
 
     // 读到静默间隙（一次读超时）即认为帧完整；总时长超限判超时
@@ -657,53 +723,72 @@ fn rtu_transact(
     let resp = buf[1..n - 2].to_vec();
     let crc = u16::from_le_bytes([buf[n - 2], buf[n - 1]]);
     if crc != super::rtu::crc16(&buf[..n - 2]) {
-        ctx.manager.emit_frame(FrameEvent::new(
-            ctx.conn_id,
-            find_device_id(ctx, unit),
-            "in",
-            &buf,
-            Some("(CRC 校验失败)".to_string()),
-        ));
+        let mut ev = FrameEvent::new(ctx.conn_id, dev_id, "in", &buf, Some("(CRC 校验失败)".to_string()));
+        ev.scan = scan;
+        ctx.manager.emit_frame(ev);
         return Err("CRC 校验失败".to_string());
     }
     if addr != unit {
         return Err("应答地址不匹配".to_string());
     }
-    ctx.manager.emit_frame(FrameEvent::new(
-        ctx.conn_id,
-        find_device_id(ctx, unit),
-        "in",
-        &buf,
-        pdu_note_resp(&resp),
-    ));
+    let mut ev = FrameEvent::new(ctx.conn_id, dev_id, "in", &buf, pdu_note_resp(&resp));
+    ev.scan = scan;
+    ctx.manager.emit_frame(ev);
     Ok((resp, buf))
 }
 
-/// RTU 事务 + 超时重试（同 TCP：1 次 + 2 次重试；IO 级错误直接上抛）
+/// RTU 事务 + 超时重试（attempts 次；IO 级错误直接上抛）
 fn rtu_transact_retry(
     io: &mut dyn RtuIo,
     ctx: &ConnCtx,
     unit: u8,
     pdu: &[u8],
     timeout_ms: u32,
+    attempts: usize,
+    scan: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    for _ in 0..ATTEMPTS {
+    for _ in 0..attempts.max(1) {
         rtu_drain(io);
-        match rtu_transact(io, ctx, unit, pdu, timeout_ms) {
+        match rtu_transact(io, ctx, unit, pdu, timeout_ms, scan) {
             Ok(v) => return Ok(v),
             Err(e) if e == "超时" => continue,
             Err(e) => return Err(e),
         }
     }
     // 重试全部超时：补一条超时标注事件（与 TCP 主机一致）
-    ctx.manager.emit_frame(FrameEvent::new(
+    let mut ev = FrameEvent::new(
         ctx.conn_id,
         find_device_id(ctx, unit),
         "in",
         &[],
         Some("(超时无应答)".to_string()),
-    ));
+    );
+    ev.scan = scan;
+    ctx.manager.emit_frame(ev);
     Err("超时".to_string())
+}
+
+/// 扫描驱动（RTU）：同 TCP 驱动的事务循环，走串口事务层（同步）
+fn run_scan_rtu(
+    io: &mut dyn RtuIo,
+    ctx: &Arc<ConnCtx>,
+    params: &ScanParams,
+    progress: &Arc<Mutex<ScanProgress>>,
+    scan_cancel: &CancellationToken,
+    stop_flag: &AtomicBool,
+    timeout_ms: u32,
+) -> ScanResult {
+    let mut eng = ScanEngine::new(params, ctx.conn_id, progress.clone(), scan_cancel.clone());
+    while let Some(req) = eng.next_request() {
+        if stop_flag.load(Ordering::Acquire) {
+            eng.abort("连接已停止");
+            break;
+        }
+        let pdu = read_pdu(req.fc, req.addr, req.qty);
+        let r = rtu_transact_retry(io, ctx, params.unit, &pdu, timeout_ms, req.attempts, true).map(|(p, _)| p);
+        eng.apply(r);
+    }
+    eng.into_result()
 }
 
 /// 采集一台设备（RTU）：分段请求 → 应答导入
@@ -728,7 +813,7 @@ fn poll_device_rtu(
         pdu.extend_from_slice(&start.to_be_bytes());
         pdu.extend_from_slice(&qty.to_be_bytes());
 
-        let r = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms).map(|(p, _)| p);
+        let r = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms, ATTEMPTS, false).map(|(p, _)| p);
         apply_poll_result(dev, area, start, qty, r)?;
     }
     Ok(())
@@ -749,6 +834,6 @@ fn handle_write_rtu(
     };
     let (area, addr, dt) = info.ok_or("点位不存在")?;
     let pdu = build_write_pdu(area, addr, dt, value)?;
-    let (resp, _) = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms)?;
+    let (resp, _) = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms, ATTEMPTS, false)?;
     apply_write_response(dev, area, addr, dt, value, &resp)
 }

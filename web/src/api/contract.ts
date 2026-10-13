@@ -1,4 +1,4 @@
-import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, ConnState, DevStat, Transport, TestConnResult, CanAgg, CanFrame } from '../types'
+import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, ConnState, DevStat, Transport, TestConnResult, CanAgg, CanFrame, ScanParams, ScanProgress, ScanResult } from '../types'
 
 /** 运行时状态推送（mock 与 tauri 两种实现共用） */
 export interface RuntimePatch {
@@ -15,6 +15,8 @@ export interface RuntimePatch {
   conn_states?: Record<number, ConnState>
   /** CAN 连接观测（连接 id → 聚合/帧率，替换式） */
   can_rx?: Record<number, CanAgg>
+  /** 点位扫描进度（连接 id → 进度，替换式：扫描结束后从推送中消失） */
+  scan?: Record<number, ScanProgress>
   paused?: boolean
 }
 
@@ -64,6 +66,12 @@ export interface NetLinkApi {
 
   /** 主机侧发送测试帧（PDU hex，不含 MBAP），返回应答 PDU hex */
   sendTestFrame(connId: number, unit: number, hex: string): Promise<string>
+
+  /** 主机侧点位扫描（长任务）：进度经 onUpdate 的 scan 字段推送，结束返回完整结果。
+   *  取消/中止也返回部分结果（aborted 字段标原因） */
+  scanPoints(connId: number, params: ScanParams): Promise<ScanResult>
+  /** 取消进行中的点位扫描 */
+  scanCancel(connId: number): Promise<void>
 
   /** CAN 手动发送一帧（插队立即发出） */
   sendCanFrame(connId: number, frame: CanFrame): Promise<void>

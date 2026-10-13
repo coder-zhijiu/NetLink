@@ -184,6 +184,63 @@ export interface FrameRecord {
   dir: 'in' | 'out'
   hex: string
   note?: string
+  /** 点位扫描事务产生的帧（监视器默认隐藏，可开） */
+  scan?: boolean
+}
+
+// ---------- Modbus 点位扫描（与 Rust 端 scan.rs 同构） ----------
+
+/** 扫描参数（下发到主机连接） */
+export interface ScanParams {
+  unit: number
+  areas: Area[]
+  /** 起始地址（含） */
+  start_addr: number
+  /** 结束地址（含） */
+  end_addr: number
+}
+
+/** 扫描发现的可读区间 */
+export interface ScanRange {
+  area: Area
+  start: number
+  /** 槽位数量（字区 = 寄存器个数；位区 = 位个数） */
+  qty: number
+  /** 每槽位原始值（寄存器原值；位区 0/1） */
+  values: number[]
+}
+
+/** 不可读的一块（存疑 / 拒读） */
+export interface ScanBlock {
+  area: Area
+  start: number
+  qty: number
+  reason: string
+}
+
+/** 扫描结果 */
+export interface ScanResult {
+  ranges: ScanRange[]
+  /** 超时未应答但设备存活的块 */
+  suspicious: ScanBlock[]
+  /** 从机明确拒绝的块 */
+  rejected: ScanBlock[]
+  /** 中止原因（取消 / 链路故障）；正常完成为 null */
+  aborted: string | null
+}
+
+/** 扫描进度（运行时逐连接推送） */
+export interface ScanProgress {
+  conn_id: number
+  unit: number
+  area: Area | null
+  cur_addr: number
+  processed: number
+  total: number
+  ranges: number
+  suspicious: number
+  done: boolean
+  aborted: string | null
 }
 
 /** 主机侧采集健康统计 */

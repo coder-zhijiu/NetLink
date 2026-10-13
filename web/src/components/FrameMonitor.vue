@@ -7,6 +7,8 @@ const autoScroll = ref(true)
 const filterDeviceId = ref<number | ''>('')
 /** 面板视图：报文流（逐帧）/ ID 聚合（CAN 接收统计） */
 const view = ref<'stream' | 'agg'>('stream')
+/** 隐藏点位扫描帧（默认隐藏，排查扫描本身时打开） */
+const hideScan = ref(true)
 
 const bodyRef = ref<HTMLElement | null>(null)
 
@@ -29,6 +31,7 @@ const deviceName = computed(() => {
 const visibleFrames = computed(() => {
   let list = store.frames
   if (filterDeviceId.value !== '') list = list.filter((f) => f.device_id === filterDeviceId.value)
+  if (hideScan.value) list = list.filter((f) => !f.scan)
   // 只渲染尾部窗口，配合环形缓冲控制 DOM 数量
   return list.slice(-400)
 })
@@ -64,6 +67,9 @@ watch(
   },
 )
 
+/** 缓冲里是否出现过扫描帧（决定「隐藏扫描帧」开关显隐——不扫描时不占位） */
+const storeHasScanFrames = computed(() => store.frames.some((f) => f.scan))
+
 function fmtTime(ts: number): string {
   const d = new Date(ts)
   const p = (n: number, w = 2) => String(n).padStart(w, '0')
@@ -92,6 +98,9 @@ function fmtTime(ts: number): string {
         <span class="chip mono" :title="`CAN 连接接收聚合（运行时生成，自动刷新）`">{{ canAggRows.length }} ID</span>
       </template>
       <div class="spacer" />
+      <label v-if="view === 'stream' && storeHasScanFrames" class="autos" title="点位扫描会产生几千帧探测报文；默认隐藏保持视野清爽，排查扫描本身时打开">
+        <input v-model="hideScan" type="checkbox" /> 隐藏扫描帧
+      </label>
       <label v-if="view === 'stream'" class="autos"><input v-model="autoScroll" type="checkbox" /> 自动滚动</label>
       <button v-if="view === 'stream'" @click="clearFrames">清空</button>
     </div>

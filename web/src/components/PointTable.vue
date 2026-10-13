@@ -23,6 +23,7 @@ import {
 } from '../types'
 import DrawerShell from './DrawerShell.vue'
 import CanFrameTable from './CanFrameTable.vue'
+import ScanPanel from './ScanPanel.vue'
 
 const device = selectedDevice
 const canNode = selectedCanNode
@@ -247,6 +248,20 @@ const sourceOptions = (Object.keys(SOURCE_LABELS) as SourceKind[]).map((k) => ({
 const exporting = ref(false)
 const sheetTip = ref('')
 
+// ---------- 点位扫描（主机连接专用） ----------
+
+const scanOpen = ref(false)
+
+function openScan() {
+  scanOpen.value = true
+}
+
+/** 扫描导入完成：给头部一条成功提示（与 CSV 导入同款） */
+function onScanImported(added: number, skipped: number) {
+  sheetTip.value = `✓ 已导入 ${added} 个扫描点位${skipped ? `（跳过 ${skipped} 个冲突）` : ''}`
+  setTimeout(() => (sheetTip.value = ''), 4000)
+}
+
 /** 选文件并解析 → 预览抽屉（确认后才真正写入点表） */
 async function onImport() {
   if (!device.value) return
@@ -337,6 +352,7 @@ async function onExport() {
       </template>
       <div class="spacer" />
       <span v-if="sheetTip" class="chip okc" :title="sheetTip">{{ sheetTip }}</span>
+      <button v-if="isMaster" :disabled="!device" title="对从机暴力探测可读地址，生成点表（扫描期间轮询自动暂停）" @click="openScan">扫描</button>
       <button :disabled="!device" title="从 xlsx / CSV 文件导入点位（先预览再写入）" @click="onImport">导入</button>
       <button :disabled="!device || exporting" title="导出该设备点表为 xlsx / CSV" @click="onExport">导出</button>
       <button class="primary" :disabled="!device" @click="openEditor(null)">＋ 新建点位</button>
@@ -491,6 +507,9 @@ async function onExport() {
         <button class="primary" @click="saveEditor">保存</button>
       </template>
     </DrawerShell>
+
+    <!-- 点位扫描面板（主机连接） -->
+    <ScanPanel v-if="scanOpen" @close="scanOpen = false" @imported="onScanImported" />
 
     <!-- 点表导入预览抽屉 -->
     <DrawerShell v-if="importing.open" title="导入点表" :width="460" @close="importing.open = false">

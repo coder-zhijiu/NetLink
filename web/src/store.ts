@@ -1,8 +1,8 @@
 import { computed, reactive } from 'vue'
 import { api } from './api'
 import { uiAlert, uiConfirm } from './ui-dialog'
-import { isCanTransport, isMasterTransport } from './types'
-import type { CanAgg, CanNode, CanPeriodicFrame, Connection, ConnState, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec } from './types'
+import { areaGlobalAddr, isCanTransport, isMasterTransport } from './types'
+import type { Area, CanAgg, CanNode, CanPeriodicFrame, Connection, ConnState, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec, ScanProgress } from './types'
 import type { RuntimePatch } from './api/contract'
 
 const FRAME_LIMIT = 5000
@@ -22,6 +22,8 @@ export const store = reactive({
   connStates: {} as Record<number, ConnState>,
   /** CAN 连接观测（conn_id → 聚合/帧率；替换式，连接停止后消失） */
   canRx: {} as Record<number, CanAgg>,
+  /** 点位扫描进度（conn_id → 进度；替换式，扫描结束 = 空表） */
+  scanProgress: {} as Record<number, ScanProgress>,
   paused: false,
   running: false,
   /** 逐连接运行状态（元素为运行中的连接 id） */
@@ -70,6 +72,7 @@ export function applyProjectHandle(h: ProjectHandle) {
   store.stats = {}
   store.connStates = {}
   store.canRx = {}
+  store.scanProgress = {}
   store.running = false
   store.runningConns = []
   store.runningDevices = []
@@ -207,6 +210,7 @@ export function applyUpdate(patch: RuntimePatch) {
   if (patch.running_devices) store.runningDevices = patch.running_devices
   if (patch.conn_states) store.connStates = patch.conn_states
   if (patch.can_rx) store.canRx = patch.can_rx
+  if (patch.scan) store.scanProgress = patch.scan
   if (patch.paused !== undefined) store.paused = patch.paused
 }
 
@@ -365,6 +369,60 @@ export async function importPoints(deviceId: number, rows: PointRow[], mode: Imp
 export function exportRowsOfDevice(deviceId: number): PointRow[] {
   const dev = allDevices().find((d) => d.id === deviceId)
   return (dev?.points ?? []).map(({ id: _id, ...row }) => row)
+}
+
+// ---------- 扫描结果导入 ----------
+
+/** 扫描预览表勾选的一个槽位 */
+export interface ScanImportRow {
+  area: Area
+  address: number
+  /** 扫描时读到的原始字值（入备注供对照说明书判断类型合并） */
+  value: number
+}
+
+/** 扫描点位名：Modicon 风格全局地址（40011 / 30025 / 00013），行业习惯一眼识区 */
+export function scanPointName(area: Area, address: number): string {
+  return areaGlobalAddr(area, address)
+}
+
+/** 导入扫描勾选的槽位：每字一点 U16（位区按 0/1）；同区同地址已有点位跳过（复用 importPoints）。
+ *  目标为 null 时先在该连接下新建设备 */
+export async function importScanPoints(
+  connId: number,
+  targetDeviceId: number | null,
+  unit: number,
+  newDeviceName: string,
+  rows: ScanImportRow[],
+): Promise<ImportOutcome> {
+  if (!store.project) throw new Error('没有打开的工程')
+  const conn = store.project.connections.find((c) => c.id === connId)
+  if (!conn) throw new Error('连接不在当前工程里')
+  let deviceId = targetDeviceId
+  if (deviceId == null) {
+    const dev: Device = {
+      id: nextDevId(),
+      name: newDeviceName.trim() || `扫描发现 · 从机 ${unit}`,
+      slave_id: unit,
+      enabled: true,
+      fault: { kind: 'normal' },
+      poll_period_ms: 1000,
+      points: [],
+    }
+    addDevice(conn.id, dev)
+    deviceId = dev.id
+  }
+  const pointRows: PointRow[] = rows.map((r) => ({
+    name: scanPointName(r.area, r.address),
+    area: r.area,
+    address: r.address,
+    // 每字一点 U16：扫描原理上不知道相邻字是独立 U16 还是 F32/U32 的低/高字，
+    // 类型留给用户对照说明书再改（原始值在备注里）
+    data_type: 'u16',
+    source: { kind: 'static', value: 0 },
+    note: `扫描发现（原始值 ${r.value}）`,
+  }))
+  return importPoints(deviceId, pointRows, 'append')
 }
 
 export function removePoint(deviceId: number, pointId: number) {

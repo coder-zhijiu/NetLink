@@ -1,8 +1,9 @@
-//! Modbus 实现：从机（TCP/RTU）+ 主机（TCP 轮询采集）。
+//! Modbus 实现：从机（TCP/RTU）+ 主机（TCP 轮询采集）+ 主机侧点位扫描。
 
 pub mod master;
 pub mod pdu;
 pub mod rtu;
+pub mod scan;
 pub mod tcp;
 
 use std::sync::{Arc, Mutex};

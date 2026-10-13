@@ -20,6 +20,9 @@ pub struct FrameEvent {
     pub hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 点位扫描事务产生的帧（监视器默认隐藏，排查扫描时可开）
+    #[serde(default)]
+    pub scan: bool,
 }
 
 impl FrameEvent {
@@ -32,6 +35,7 @@ impl FrameEvent {
             dir: dir.to_string(),
             hex: hex_str(bytes),
             note,
+            scan: false,
         }
     }
 }

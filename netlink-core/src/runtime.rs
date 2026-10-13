@@ -13,6 +13,7 @@ use crate::model::{Area, Connection, DataType, Device, FaultConfig, ProjectSpec,
 use crate::protocol::FrameEvent;
 use crate::protocol::can::{CanAgg, CanAggSnapshot, CanMsg, CanNodeRuntime};
 use crate::protocol::modbus::master::{self, MasterMsg};
+use crate::protocol::modbus::scan::{ScanParams, ScanProgress, ScanResult};
 use crate::sim;
 
 /// 设备仿真 tick 周期
@@ -533,6 +534,12 @@ pub struct ConnStatus {
     pub detail: Option<String>,
 }
 
+/// 一条主机连接上正在进行的点位扫描（进度推送 + 取消句柄）
+struct ScanHandle {
+    cancel: CancellationToken,
+    progress: Arc<Mutex<ScanProgress>>,
+}
+
 /// 运行时总管理器：跨连接共享仿真时钟与帧广播。
 /// Clone 后内部共享同一状态。
 #[derive(Clone)]
@@ -546,6 +553,8 @@ struct RuntimeInner {
     conns: Mutex<HashMap<u64, ConnState>>,
     /// 主机连接链路状态（conn_id → 状态；连接停止时清除）
     conn_states: Mutex<HashMap<u64, ConnStatus>>,
+    /// 进行中的点位扫描（conn_id → 句柄；扫描结束/连接停止时移除）
+    scans: Mutex<HashMap<u64, ScanHandle>>,
     frame_seq: std::sync::atomic::AtomicU64,
 }
 
@@ -558,6 +567,7 @@ impl RuntimeManager {
                 frame_tx,
                 conns: Mutex::new(HashMap::new()),
                 conn_states: Mutex::new(HashMap::new()),
+                scans: Mutex::new(HashMap::new()),
                 frame_seq: std::sync::atomic::AtomicU64::new(1),
             }),
         }
@@ -812,6 +822,7 @@ impl RuntimeManager {
     /// 停止单条连接；返回该连接此前是否在运行
     pub fn stop_connection(&self, id: u64) -> bool {
         self.inner.conn_states.lock().unwrap().remove(&id);
+        self.inner.scans.lock().unwrap().remove(&id);
         if let Some(state) = self.inner.conns.lock().unwrap().remove(&id) {
             state.cancel.cancel();
             for t in state.tasks {
@@ -998,6 +1009,63 @@ impl RuntimeManager {
             .await
             .map_err(|_| "主机连接已停止".to_string())?;
         reply_rx.await.map_err(|_| "测试帧无应答".to_string())?
+    }
+
+    /// 主机侧点位扫描（长任务）：进度经扫描句柄实时推送，结果通过返回值一次性带回。
+    /// 期间可用 [`Self::scan_cancel`] 取消（取消返回部分结果）。返回后句柄移除。
+    pub async fn scan_points(&self, conn_id: u64, params: ScanParams) -> Result<ScanResult, String> {
+        let tx = {
+            let conns = self.inner.conns.lock().unwrap();
+            match conns.get(&conn_id) {
+                Some(state) => state.cmd_tx.clone(),
+                None => return Err("连接不存在或未启动".to_string()),
+            }
+        };
+        let tx = tx.ok_or_else(|| "该连接不是主机连接".to_string())?;
+        let cancel = CancellationToken::new();
+        let progress = Arc::new(Mutex::new(ScanProgress {
+            conn_id,
+            unit: params.unit,
+            ..ScanProgress::default()
+        }));
+        self.inner.scans.lock().unwrap().insert(
+            conn_id,
+            ScanHandle { cancel: cancel.clone(), progress: progress.clone() },
+        );
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx
+            .send(MasterMsg::Scan { params, cancel, progress, reply: reply_tx })
+            .await
+            .is_err()
+        {
+            self.inner.scans.lock().unwrap().remove(&conn_id);
+            return Err("主机连接已停止".to_string());
+        }
+        // 等扫描结束（完成/取消/连接重启都会让 reply 到达或通道关闭）
+        let result = reply_rx.await.map_err(|_| "扫描被中断（连接已重启或停止）".to_string());
+        self.inner.scans.lock().unwrap().remove(&conn_id);
+        result
+    }
+
+    /// 取消进行中的扫描（无扫描时报错）
+    pub fn scan_cancel(&self, conn_id: u64) -> Result<(), String> {
+        let scans = self.inner.scans.lock().unwrap();
+        match scans.get(&conn_id) {
+            Some(h) => {
+                h.cancel.cancel();
+                Ok(())
+            }
+            None => Err("该连接没有进行中的扫描".to_string()),
+        }
+    }
+
+    /// 进行中扫描的进度快照（conn_id → 进度）
+    pub fn snapshot_scan_progress(&self) -> Vec<(u64, ScanProgress)> {
+        let scans = self.inner.scans.lock().unwrap();
+        scans
+            .iter()
+            .map(|(id, h)| (*id, h.progress.lock().unwrap().clone()))
+            .collect()
     }
 }
 
