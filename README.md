@@ -50,11 +50,11 @@ NetLink 是一款面向电力/工业现场调试的**多协议主/从机模拟�
 
 ## 下载与安装
 
-从 [Releases](https://github.com/coder-zhijiu/NetLink/releases/latest) 下载 v1.0.0：
+从 [Releases](https://github.com/coder-zhijiu/NetLink/releases/latest) 下载 v1.1.0：
 
 | 文件 | 说明 |
 |---|---|
-| `NetLink_1.0.0_x64-setup.exe` | **NSIS 安装程序**（约 3.4 MB）——双击安装，含 WebView2 运行时引导、开始菜单/桌面快捷方式、卸载器；默认安装到当前用户目录，无需管理员权限 |
+| `NetLink_1.1.0_x64-setup.exe` | **NSIS 安装程序**（约 3.4 MB）——双击安装，含 WebView2 运行时引导、开始菜单/桌面快捷方式、卸载器；默认安装到当前用户目录，无需管理员权限 |
 | `netlink-app.exe` | **绿色单文件**（约 13 MB）——前端已内置，系统装有 WebView2 即可直接运行；工程目录自动建在 exe 旁 |
 
 系统要求：Windows 10 及以上（依赖 WebView2：Win11 自带；Win10 上安装包会自动引导安装）。
