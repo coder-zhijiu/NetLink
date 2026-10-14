@@ -2,16 +2,22 @@
 //!
 //! Modbus 协议没有枚举点表的能力，扫描 = 暴力探测 + 从机应答语义推理：
 //! - 正常应答 → 整块可读，记录每个槽位的原始值；
-//! - 异常码 02（非法地址）→ 块内定界：二分找最长有效前缀，再二分找有效后缀。
-//!   从机普遍实现为「请求范围内任一地址非法即整段拒绝」，二分正好适用；
+//! - 异常码 02（非法地址）及厂商自定义「地址非法」码（如锦浪用 0x05 表示
+//!   HMI/DSP 取不到该地址数据）→ 块内定界：二分找最长有效前缀，再二分找
+//!   有效后缀。从机普遍实现为「请求范围内任一地址非法即整段拒绝」，二分
+//!   正好适用；
 //! - 超时 → 同样走块内二分定界（超时当「失败」收敛——对「读不到就静默」型
 //!   从机，二分对单调语义同样成立，有效窗口照样能以 O(log) 剥离出来）；
 //!   超时间隔节流地探活：已知会应答的地址直接回读（3 次尝试）；还不知道任何
-//!   会应答的地址时先阶梯采样请求块的首/中/尾（各 1 次）。探活有任何应答
-//!   （含异常应答）= 设备活着继续扫；探活也无应答 = 判链路/设备故障中止——
-//!   不把活设备扫成空表，也不无限等待；
+//!   会应答的地址时先阶梯采样请求块的首/中/尾（各 1 次）。探活任何应答
+//!   （含异常应答）= 设备活着继续扫；探活也无应答 ≠ 直接判死——先换本区域
+//!   功能码之外的其他读功能码复检（有的设备对不支持的功能码整体静默，如
+//!   锦浪对 FC01）：换码有应答 = 设备在线、该功能码静默，跳过该区域继续
+//!   扫其余区域；换码也无应答 = 判链路/设备故障中止——不把活设备扫成空表，
+//!   也不无限等待；
 //! - 异常码 03（非法值）→ 多为设备拒绝大数量读：块宽减半重试（自适应到 1）；
-//! - 其他异常码 → 该区域剩余地址拒读，跳过（避免逐块刷屏）。
+//! - 功能码级（01 不支持）/网关级（0x0A/0x0B 路径故障）异常 → 该区域剩余
+//!   地址拒读，跳过（避免逐块刷屏）。
 //!
 //! 已知限制：夹在无效地址中间、且不触及块边界/不跨块延续的孤立可读段发现不了
 //! （块读探测类工具的固有限制；真实装置点表基本是连续窗口，极少踩中）。
@@ -31,7 +37,9 @@ use crate::model::Area;
 const PROBE_EVERY: u32 = 8;
 
 /// 探活状态机：无已知「会应答的地址」时先阶梯采样（块首/块中/块尾），
-/// 任何一点有应答即证明设备存活并升级为回读探活
+/// 任何一点有应答即证明设备存活并升级为回读探活。
+/// 同功能码探活全静默 → Cross：换其他读功能码复检设备死活
+/// （有的设备对不支持的功能码整体静默，如锦浪对 FC01）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ProbeState {
     None,
@@ -39,6 +47,8 @@ enum ProbeState {
     LastOk,
     /// 阶梯采样第 idx 档（0/1/2 = 请求块的 首/中/尾，各 1 次尝试）
     Ladder(u8),
+    /// 换码复检第 idx 个（当前区域功能码之外的读功能码，各 1 次尝试）
+    Cross(u8),
 }
 
 /// 阶梯第 idx 档的采样地址（基于超时的那个请求范围）
@@ -49,6 +59,26 @@ fn ladder_addr(idx: u8, req: &ScanReq) -> u16 {
         _ => req.qty as u32 - 1,
     };
     (req.addr as u32 + off).min(u16::MAX as u32) as u16
+}
+
+/// 探活失败后换码复检的功能码列表（当前区域功能码之外的三个读功能码）
+fn cross_fcs(area: Area) -> [u8; 3] {
+    match area_fc(area) {
+        0x01 => [0x02, 0x03, 0x04],
+        0x02 => [0x01, 0x03, 0x04],
+        0x03 => [0x01, 0x02, 0x04],
+        _ => [0x01, 0x02, 0x03],
+    }
+}
+
+/// 功能码 → 区域（cross 探活锚点记录用）
+fn fc_area(fc: u8) -> Area {
+    match fc {
+        0x01 => Area::Coil,
+        0x02 => Area::DiscreteInput,
+        0x03 => Area::HoldingRegister,
+        _ => Area::InputRegister,
+    }
 }
 
 // ---------- 扫描参数与结果（与前端 types.ts 同构） ----------
@@ -299,6 +329,10 @@ impl ScanEngine {
                     ProbeState::Ladder(idx) => {
                         ScanReq { fc: area_fc(self.area), addr: ladder_addr(idx, &self.last_req), qty: 1, attempts: 1 }
                     }
+                    ProbeState::Cross(idx) => {
+                        let fc = cross_fcs(self.area)[idx as usize];
+                        ScanReq { fc, addr: self.last_req.addr, qty: 1, attempts: 1 }
+                    }
                     ProbeState::None => unreachable!(),
                 });
             }
@@ -385,27 +419,58 @@ impl ScanEngine {
             self.to_since_probe = 0;
             match resp {
                 Ok(_) => {
-                    // 任何应答（含异常码）都证明链路活着；阶梯命中点升级为回读探活目标
-                    if let ProbeState::Ladder(idx) = self.probe {
-                        self.probe_addr = Some((self.area, ladder_addr(idx, &self.last_req) as u32));
+                    // 任何应答（含异常码）都证明链路活着
+                    let was_cross = matches!(self.probe, ProbeState::Cross(_));
+                    match self.probe {
+                        ProbeState::Ladder(idx) => {
+                            // 阶梯命中点升级为回读探活目标
+                            self.probe_addr = Some((self.area, ladder_addr(idx, &self.last_req) as u32));
+                        }
+                        ProbeState::Cross(idx) => {
+                            // 换码复检有应答：设备在线，当前区域的功能码静默。
+                            // 锚点记为应答的那个（区, 地址），供后续区域探活回读
+                            let fc = cross_fcs(self.area)[idx as usize];
+                            self.probe_addr = Some((fc_area(fc), self.last_req.addr as u32));
+                        }
+                        _ => {}
                     }
                     self.probe = ProbeState::None;
-                    let req = self.last_req.clone();
-                    self.on_timeout_fail(&req);
+                    if was_cross {
+                        // 该功能码对本设备静默（如锦浪对 FC01）：整区跳过，
+                        // 别对死功能码做整区二分白烧时间；其余区域继续扫
+                        self.skip_area_rest(format!(
+                            "功能码 0x{:02X} 探活无应答，但换其他功能码有应答（设备在线；可能不支持该功能码且静默），跳过该区域剩余地址",
+                            area_fc(self.area)
+                        ));
+                    } else {
+                        let req = self.last_req.clone();
+                        self.on_timeout_fail(&req);
+                    }
                 }
                 Err(e) if e == "超时" => match self.probe {
                     ProbeState::Ladder(idx) if idx < 2 => {
                         self.probe = ProbeState::Ladder(idx + 1);
                     }
-                    _ => {
-                        self.probe = ProbeState::None;
-                        let msg = if self.probe_addr.is_some() {
-                            "设备无应答（探活失败），扫描中止".to_string()
-                        } else {
-                            "从机无应答（采样块首/块中/块尾均无应答；设备离线，或为「无效地址不吭声」型设备——后者请把范围收窄到已知可读地址附近再扫）".to_string()
-                        };
-                        self.result.aborted = Some(msg);
+                    // 同功能码阶梯/回读探活全静默：换其他读功能码复检设备死活
+                    ProbeState::Ladder(_) | ProbeState::LastOk => {
+                        self.probe = ProbeState::Cross(0);
                     }
+                    ProbeState::Cross(idx) => {
+                        let fcs = cross_fcs(self.area);
+                        if (idx as usize) + 1 < fcs.len() {
+                            self.probe = ProbeState::Cross(idx + 1);
+                        } else {
+                            // 换遍所有读功能码都无应答：设备离线
+                            self.probe = ProbeState::None;
+                            let msg = if self.probe_addr.is_some() {
+                                "设备无应答（探活失败），扫描中止".to_string()
+                            } else {
+                                "从机无应答（采样块首/块中/块尾均无应答，且换其他功能码复检也无应答；设备离线，或为「无效地址不吭声」型设备——后者请把范围收窄到已知可读地址附近再扫）".to_string()
+                            };
+                            self.result.aborted = Some(msg);
+                        }
+                    }
+                    ProbeState::None => unreachable!(),
                 },
                 Err(e) => {
                     self.probe = ProbeState::None;
@@ -449,15 +514,25 @@ impl ScanEngine {
                 }
                 Parsed::Exc(code) => match self.phase {
                     Phase::Block => {
-                        // 区域级拒绝（功能码不支持 / 从机故障 / 单点读仍拒绝）：
-                        // 记一条并跳过该区域剩余地址，避免逐块刷屏
-                        let reason = match code {
-                            0x01 => "异常码 0x01（功能码不支持），跳过该区域剩余地址".into(),
-                            0x03 => "异常码 0x03（拒绝单点读），跳过该区域剩余地址".into(),
-                            0x0B => "异常码 0x0B（网关目标设备无应答），跳过该区域剩余地址".into(),
-                            _ => format!("异常码 0x{code:02X}，跳过该区域剩余地址"),
-                        };
-                        self.skip_area_rest(reason);
+                        // 功能码级（01 不支持）/网关级（0x0A/0x0B 路径故障）/
+                        // 拒绝单点读（03 且已减到 1）→ 整区跳过；
+                        // 其余异常码（02 与厂商自定义码，如锦浪用 0x05 表示该
+                        // 地址取不到数据）按「任一地址非法即整段拒绝」块内定界
+                        // ——Prefix/Suffix 相位本就把一切异常当失败收敛，Block
+                        // 相位与之对齐，自定义码的窗口照样能二分剥出来
+                        let area_level = matches!(code, 0x01 | 0x0A | 0x0B) || (code == 0x03 && self.width <= 1);
+                        if area_level {
+                            let reason = match code {
+                                0x01 => "异常码 0x01（功能码不支持），跳过该区域剩余地址".into(),
+                                0x03 => "异常码 0x03（拒绝单点读），跳过该区域剩余地址".into(),
+                                0x0A => "异常码 0x0A（网关路径故障），跳过该区域剩余地址".into(),
+                                0x0B => "异常码 0x0B（网关目标设备无应答），跳过该区域剩余地址".into(),
+                                _ => format!("异常码 0x{code:02X}，跳过该区域剩余地址"),
+                            };
+                            self.skip_area_rest(reason);
+                        } else {
+                            self.enter_refine(req.qty as u32);
+                        }
                     }
                     Phase::Prefix => self.fail_k = req.qty as u32,
                     Phase::Suffix => self.fail_j = req.addr as u32,
@@ -587,7 +662,9 @@ mod tests {
     /// 内存从机应答器。valid 为 (区, 起, 止) 可读区间列表。
     /// 对「范围内任一地址非法」的请求：
     /// - mode=Exc02：回异常 02（标准从机）；
-    /// - mode=Silent：不应答（「读不到就静默」型，走超时+探活+二分路径）。
+    /// - mode=Silent：不应答（「读不到就静默」型，走超时+探活+二分路径）；
+    /// - mode=Exc05：锦浪型——FC01 整体静默（不支持的功能码不吭声），
+    ///   其余功能码对非法地址回厂商异常码 0x05（HMI/DSP 取不到数据）。
     /// 完全可读的请求正常应答（字区回递增值，位区按地址模 3 的位型）。
     struct FakeSlave {
         valid: Vec<(Area, u32, u32)>,
@@ -598,6 +675,7 @@ mod tests {
     enum InvalidMode {
         Exc02,
         Silent,
+        Exc05,
     }
 
     impl FakeSlave {
@@ -631,6 +709,12 @@ mod tests {
                 }
             } else if self.mode == InvalidMode::Exc02 {
                 Ok(vec![req.fc | 0x80, 0x02])
+            } else if self.mode == InvalidMode::Exc05 {
+                if req.fc == 0x01 {
+                    Err("超时".into()) // 锦浪：不支持的功能码整体静默
+                } else {
+                    Ok(vec![req.fc | 0x80, 0x05])
+                }
             } else {
                 Err("超时".into())
             }
@@ -774,6 +858,43 @@ mod tests {
         assert!(msg.contains("收窄"), "应给出收窄建议: {msg}");
         assert!(r.ranges.is_empty());
         assert!(r.suspicious.is_empty());
+    }
+
+    /// 锦浪型从机（实测行为）：FC01 整体静默 + 范围外回厂商异常码 0x05。
+    /// 修复前：线圈区排最前，FC01 静默 → 探活阶梯也用 FC01 → 误判「设备
+    /// 离线」整扫中止，永远轮不到真正有数据的输入寄存器区；即使单扫
+    /// 输入寄存器区，范围外 0x05 也被当「其他异常码」整区拒读，2999 起的
+    /// 窗口照样找不到。
+    /// 修复后：换码探活确认在线 → 线圈区整区跳过（拒读记录注明功能码静默）；
+    /// 0x05 当「任一地址非法」走二分定界 → 输入寄存器窗口完整剥出。
+    #[test]
+    fn solis_like_silent_fc01_and_exc05_still_finds_window() {
+        let slave = FakeSlave { valid: vec![(Area::InputRegister, 2999, 3546)], mode: InvalidMode::Exc05 };
+        let r = run(&slave, &params(&[Area::Coil, Area::DiscreteInput, Area::HoldingRegister, Area::InputRegister], 0, 4095));
+        assert!(r.aborted.is_none(), "设备在线不应中止: {:?}", r.aborted);
+        // 输入寄存器窗口 [2999, 3546) 完整剥出（跨块合并）
+        let input: Vec<_> = r.ranges.iter().filter(|x| x.area == Area::InputRegister).collect();
+        assert_eq!(input.len(), 1);
+        assert_eq!((input[0].start, input[0].qty), (2999, 547));
+        assert_eq!(input[0].values.len(), 547);
+        // 线圈区：换码探活确认在线后整区跳过，拒读原因注明「功能码静默」
+        let coil_rej: Vec<_> = r.rejected.iter().filter(|b| b.area == Area::Coil).collect();
+        assert_eq!(coil_rej.len(), 1);
+        assert!(coil_rej[0].reason.contains("静默"), "拒读原因应说明功能码静默: {}", coil_rej[0].reason);
+        // 其余区域：响应型失败（0x05）定界收敛为空，不产生存疑/中止
+        assert_eq!(r.suspicious.len(), 0);
+        let other_ranges: Vec<_> = r.ranges.iter().filter(|x| x.area != Area::InputRegister).collect();
+        assert!(other_ranges.is_empty());
+    }
+
+    /// 全功能码静默（真离线）：换码复检穷尽后仍按「设备离线」中止，
+    /// 且中止消息注明已做过换码复检
+    #[test]
+    fn solis_like_truly_offline_aborts() {
+        let slave = FakeSlave { valid: vec![], mode: InvalidMode::Silent };
+        let r = run(&slave, &params(&[Area::Coil, Area::InputRegister], 0, 99));
+        assert!(r.aborted.is_some());
+        assert!(r.aborted.unwrap().contains("换其他功能码"), "应注明已换码复检");
     }
 
     /// 取消：下一笔请求前检测到取消 → 中止原因「已取消」
