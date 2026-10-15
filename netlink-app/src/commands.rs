@@ -527,6 +527,15 @@ async fn ensure_runtime(app: &AppHandle, state: &AppState) -> RuntimeManager {
                     }
                     patch.insert("values".into(), Value::Object(map));
                 }
+                // 寄存器原始值（实时值悬浮换算提示用，与 values 同节奏）
+                let raws = push_manager.snapshot_raws(dev);
+                if !raws.is_empty() {
+                    let mut map = Map::new();
+                    for (id, v) in raws {
+                        map.insert(id.to_string(), Value::from(v));
+                    }
+                    patch.insert("raws".into(), Value::Object(map));
+                }
             }
             patch.insert("running".into(), json!(push_manager.is_running()));
             // 采集健康统计（主机设备）

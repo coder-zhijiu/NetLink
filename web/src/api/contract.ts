@@ -4,6 +4,8 @@ import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResul
 export interface RuntimePatch {
   frames?: FrameRecord[]
   values?: Record<number, number>
+  /** 寄存器原始值（与 values 同节奏；实时值悬浮换算提示用） */
+  raws?: Record<number, number>
   /** 主机侧采集健康统计（device_id → stat） */
   stats?: Record<number, DevStat>
   running?: boolean

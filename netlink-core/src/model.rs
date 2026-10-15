@@ -128,6 +128,15 @@ pub enum ValueSource {
 
 // ---------- 点位 ----------
 
+/// 换算系数缺省（旧工程文件缺字段时按无换算处理）
+fn d_scale() -> f64 {
+    1.0
+}
+/// 换算偏移量缺省
+fn d_offset() -> f64 {
+    0.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Point {
     pub id: u64,
@@ -135,6 +144,12 @@ pub struct Point {
     pub area: Area,
     pub address: u16,
     pub data_type: DataType,
+    /// 工程量换算：工程值 = 原始值 × scale + offset；从机寄存器存 (工程值 − offset) ÷ scale。
+    /// 位区域（线圈/离散输入）不换算。区别于正弦源的波形基线 offset。
+    #[serde(default = "d_scale")]
+    pub scale: f64,
+    #[serde(default = "d_offset")]
+    pub offset: f64,
     pub source: ValueSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -423,6 +438,8 @@ impl ProjectSpec {
                 area,
                 address,
                 data_type,
+                scale: 1.0,
+                offset: 0.0,
                 source,
                 note: None,
             }

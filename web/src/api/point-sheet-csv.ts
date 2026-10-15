@@ -3,9 +3,58 @@ import { AREA_LABELS, SOURCE_LABELS } from '../types'
 
 /**
  * 浏览器演示模式（mock）的点表 CSV 文本解析/生成。
- * 列格式与 netlink-core/src/sheet.rs 严格一致：
- * 名称,区域,地址,类型,数据源,静态值,周期(秒),幅值,偏移,步长,下限,上限,备注
+ * 列格式与 netlink-core/src/sheet.rs 严格一致（15 列）：
+ * 名称,区域,地址,类型,数据源,静态值,周期(秒),幅值,偏移,步长,下限,上限,系数,换算偏移,备注
+ *
+ * 解析按表头名映射列（表头齐备 5 个必需列时）：列序自由、旧 13 列文件缺换算列按默认；
+ * 「偏移」= 正弦波形基线，「换算偏移」= 工程量换算偏移，同名不同义。
  */
+
+/** 逻辑列 → 15 列布局里的位置（无表头/残缺表头文件按此解析） */
+const COL_POSITION: Record<string, number> = {
+  name: 0,
+  area: 1,
+  addr: 2,
+  type: 3,
+  source: 4,
+  value: 5,
+  period: 6,
+  amplitude: 7,
+  sine_offset: 8,
+  step: 9,
+  min: 10,
+  max: 11,
+  scale: 12,
+  eng_offset: 13,
+  note: 14,
+}
+
+/** 表头单元格文本 → 逻辑列（与 Rust 端 header_col 别名一致） */
+const HEADER_TO_COL: Record<string, string> = {
+  '名称': 'name',
+  name: 'name',
+  '点名称': 'name',
+  '区域': 'area',
+  '地址': 'addr',
+  '类型': 'type',
+  '数据源': 'source',
+  '静态值': 'value',
+  '周期(秒)': 'period',
+  '周期（秒）': 'period',
+  '周期': 'period',
+  '幅值': 'amplitude',
+  '偏移': 'sine_offset',
+  '步长': 'step',
+  '下限': 'min',
+  '上限': 'max',
+  '系数': 'scale',
+  '换算偏移': 'eng_offset',
+  '偏移量': 'eng_offset',
+  '备注': 'note',
+}
+
+/** 表头名映射生效所需的必需逻辑列 */
+const REQUIRED_COLS = ['name', 'area', 'addr', 'type', 'source']
 
 const AREA_CN_TO_KEY: Record<string, Area> = {
   '线圈': 'coil',
@@ -106,64 +155,101 @@ function rowToParams(source: ValueSource): string[] {
   return v
 }
 
-/** 解析 CSV 文本（表头自动跳过；坏行收集错误不中断） */
+/** CSV 首行是否为表头行 */
+function isHeaderLine(cells: string[]): boolean {
+  const h = (cells[0] ?? '').trim()
+  return h === '名称' || h.toLowerCase() === 'name' || h === '点名称'
+}
+
+/** 解析 CSV 文本（表头齐备必需列时按表头名映射，否则 15 列位置式；坏行收集错误不中断） */
 export function parseCsvText(text: string): SheetParseResult {
   const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter((l) => l.trim() !== '')
   const result: SheetParseResult = { rows: [], errors: [] }
-  const first = lines[0]?.split(',')[0]?.trim() ?? ''
-  const start = first === '名称' || first.toLowerCase() === 'name' ? 1 : 0
+  if (lines.length === 0) return result
+
+  // 表头 → 逻辑列 → 列下标映射；残缺表头（缺必需列）退回位置式并跳过首行（兼容旧行为）
+  let start = 0
+  let map: Record<string, number> | null = null
+  const first = splitCsvLine(lines[0])
+  if (isHeaderLine(first)) {
+    start = 1
+    const m: Record<string, number> = {}
+    first.forEach((h, i) => {
+      const col = HEADER_TO_COL[h.trim()]
+      if (col && !(col in m)) m[col] = i
+    })
+    if (REQUIRED_COLS.every((c) => c in m)) map = m
+  }
+
   for (let i = start; i < lines.length; i++) {
     const cells = splitCsvLine(lines[i])
     const line = i + 1
-    const name = (cells[0] ?? '').trim()
+    // 按逻辑列取单元格文本（映射式缺列给空串 → 默认值）
+    const col = (key: string): string => {
+      if (map) return cells[map[key]] ?? ''
+      return cells[COL_POSITION[key]] ?? ''
+    }
+    const name = col('name').trim()
     if (!name) {
       result.errors.push({ line, reason: '名称为空' })
       continue
     }
-    const area = AREA_CN_TO_KEY[(cells[1] ?? '').trim()]
+    const area = AREA_CN_TO_KEY[col('area').trim()]
     if (!area) {
-      result.errors.push({ line, reason: `区域「${cells[1] ?? ''}」无法识别（可用：${Object.values(AREA_LABELS).join('/')}）` })
+      result.errors.push({ line, reason: `区域「${col('area')}」无法识别（可用：${Object.values(AREA_LABELS).join('/')}）` })
       continue
     }
-    const address = Number((cells[2] ?? '').trim())
+    const address = Number(col('addr').trim())
     if (!Number.isInteger(address) || address < 0 || address > 65535) {
-      result.errors.push({ line, reason: `地址「${cells[2] ?? ''}」不是 0~65535 的整数` })
+      result.errors.push({ line, reason: `地址「${col('addr')}」不是 0~65535 的整数` })
       continue
     }
-    const dataType = (cells[3] ?? '').trim().toLowerCase() as DataType
+    const dataType = col('type').trim().toLowerCase() as DataType
     if (!DATA_TYPES.includes(dataType)) {
-      result.errors.push({ line, reason: `类型「${cells[3] ?? ''}」无法识别（可用：${DATA_TYPES.join('/')}）` })
+      result.errors.push({ line, reason: `类型「${col('type')}」无法识别（可用：${DATA_TYPES.join('/')}）` })
       continue
     }
-    const kind = SOURCE_CN_TO_KEY[(cells[4] ?? '').trim()]
+    const kind = SOURCE_CN_TO_KEY[col('source').trim()]
     if (!kind) {
-      result.errors.push({ line, reason: `数据源「${cells[4] ?? ''}」无法识别（可用：${Object.values(SOURCE_LABELS).join('/')}）` })
+      result.errors.push({ line, reason: `数据源「${col('source')}」无法识别（可用：${Object.values(SOURCE_LABELS).join('/')}）` })
       continue
     }
-    // 参数列：空单元格用默认值；坏数字记行错误
-    const num = (idx: number, col: string, def: number): number => {
-      const s = (cells[idx] ?? '').trim()
+    // 参数列：表头缺列或空单元格用默认值；坏数字记行错误
+    const num = (key: string, label: string, def: number): number => {
+      const s = col(key).trim()
       if (s === '') return def
       const n = Number(s)
-      if (Number.isNaN(n)) throw new Error(`${col}列「${s}」不是数字`)
+      if (Number.isNaN(n)) throw new Error(`${label}列「${s}」不是数字`)
       return n
     }
     let source: ValueSource
+    let scale: number | undefined
+    let offset: number | undefined
     try {
       source = { kind }
-      if (kind === 'static') source.value = num(5, '静态值', 0)
-      if (kind === 'sine' || kind === 'swing') source.period_s = num(6, '周期', 10)
+      if (kind === 'static') source.value = num('value', '静态值', 0)
+      if (kind === 'sine' || kind === 'swing') source.period_s = num('period', '周期', 10)
       if (kind === 'sine') {
-        source.amplitude = num(7, '幅值', 1)
-        source.offset = num(8, '偏移', 0)
+        source.amplitude = num('amplitude', '幅值', 1)
+        source.offset = num('sine_offset', '偏移', 0)
       }
-      if (kind === 'ramp' || kind === 'random_walk') source.step = num(9, '步长', 1)
+      if (kind === 'ramp' || kind === 'random_walk') source.step = num('step', '步长', 1)
       if (kind === 'ramp' || kind === 'random_walk' || kind === 'swing') {
-        source.min = num(10, '下限', 0)
-        source.max = num(11, '上限', 100)
+        source.min = num('min', '下限', 0)
+        source.max = num('max', '上限', 100)
       }
+      scale = num('scale', '系数', 1)
+      offset = num('eng_offset', '换算偏移', 0)
     } catch (e) {
       result.errors.push({ line, reason: e instanceof Error ? e.message : String(e) })
+      continue
+    }
+    // 位区域是开关量不换算；系数 0 会除零
+    if (area === 'coil' || area === 'discrete_input') {
+      scale = 1
+      offset = 0
+    } else if (scale === 0) {
+      result.errors.push({ line, reason: '系数不能为 0（工程值换算会除零）' })
       continue
     }
     result.rows.push({
@@ -171,8 +257,10 @@ export function parseCsvText(text: string): SheetParseResult {
       area,
       address,
       data_type: dataType,
+      scale,
+      offset,
       source,
-      note: (cells[12] ?? '').trim() || undefined,
+      note: col('note').trim() || undefined,
     })
   }
   return result
@@ -180,11 +268,26 @@ export function parseCsvText(text: string): SheetParseResult {
 
 /** 生成 CSV 文本（无 BOM；mock 下载用，桌面版由 Rust 端写 BOM） */
 export function writeCsvText(rows: PointRow[]): string {
-  const header = '名称,区域,地址,类型,数据源,静态值,周期(秒),幅值,偏移,步长,下限,上限,备注'
-  const lines = rows.map((r) =>
-    [r.name, AREA_KEY_TO_CN[r.area], String(r.address), r.data_type, SOURCE_LABELS[r.source.kind], ...rowToParams(r.source), r.note ?? '']
+  const header = '名称,区域,地址,类型,数据源,静态值,周期(秒),幅值,偏移,步长,下限,上限,系数,换算偏移,备注'
+  const lines = rows.map((r) => {
+    // 换算列：位区域或恒等参数留空（导入按默认 1/0，表格干净）
+    const identity = (r.scale ?? 1) === 1 && (r.offset ?? 0) === 0
+    const isBit = r.area === 'coil' || r.area === 'discrete_input'
+    const scaleCell = isBit || identity ? '' : trimNum(r.scale ?? 1)
+    const offsetCell = isBit || identity ? '' : trimNum(r.offset ?? 0)
+    return [
+      r.name,
+      AREA_KEY_TO_CN[r.area],
+      String(r.address),
+      r.data_type,
+      SOURCE_LABELS[r.source.kind],
+      ...rowToParams(r.source),
+      scaleCell,
+      offsetCell,
+      r.note ?? '',
+    ]
       .map(escapeCsvField)
-      .join(','),
-  )
+      .join(',')
+  })
   return [header, ...lines].join('\r\n')
 }

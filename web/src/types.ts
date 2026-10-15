@@ -53,6 +53,10 @@ export interface Point {
   area: Area
   address: number
   data_type: DataType
+  /** 工程量换算系数（默认 1；位区域不适用）。工程值 = 原始值 × 系数 + 偏移量 */
+  scale?: number
+  /** 工程量换算偏移量（默认 0；位区域不适用）。区别于正弦源 source.offset（波形基线） */
+  offset?: number
   source: ValueSource
   note?: string
 }
@@ -159,6 +163,10 @@ export interface PointRow {
   area: Area
   address: number
   data_type: DataType
+  /** 工程量换算系数（默认 1；位区域不适用） */
+  scale?: number
+  /** 工程量换算偏移量（默认 0） */
+  offset?: number
   source: ValueSource
   note?: string
 }
@@ -373,13 +381,39 @@ export function formatValue(v: number | undefined, dt: DataType): string {
   }
 }
 
+// ---------- 工程量换算（与 Rust 端 runtime::raw_to_eng / eng_to_raw 同构） ----------
+
+/** 换算是否实际生效（非恒等参数且非位区域）——悬浮提示与编辑器禁用判断用 */
+export function hasScaleTransform(p: Pick<Point, 'area' | 'scale' | 'offset'>): boolean {
+  if (p.area === 'coil' || p.area === 'discrete_input') return false
+  return (p.scale ?? 1) !== 1 || (p.offset ?? 0) !== 0
+}
+
+/** 原始寄存器值 → 工程值：raw × 系数 + 偏移量（位区域不换算；系数 0 按 1 兜底） */
+export function rawToEng(raw: number, area: Area, scale?: number, offset?: number): number {
+  if (area === 'coil' || area === 'discrete_input') return raw
+  const k = scale ?? 1
+  const b = offset ?? 0
+  if (k === 1 && b === 0) return raw
+  return raw * (k === 0 ? 1 : k) + b
+}
+
+/** 工程值 → 原始寄存器值：(v − 偏移量) ÷ 系数（位区域不换算；系数 0 按 1 兜底） */
+export function engToRaw(v: number, area: Area, scale?: number, offset?: number): number {
+  if (area === 'coil' || area === 'discrete_input') return v
+  const k = scale ?? 1
+  const b = offset ?? 0
+  if (k === 1 && b === 0) return v
+  return (v - b) / (k === 0 ? 1 : k)
+}
+
 /** 数据源参数的可读摘要（表格里用） */
 export function sourceSummary(s: ValueSource): string {
   switch (s.kind) {
     case 'static':
       return `值=${s.value ?? 0}`
     case 'sine':
-      return `周期=${s.period_s ?? 10}s 幅值=${s.amplitude ?? 1} 偏移=${s.offset ?? 0}`
+      return `周期=${s.period_s ?? 10}s 幅值=${s.amplitude ?? 1} 基线=${s.offset ?? 0}`
     case 'ramp':
       return `步长=${s.step ?? 1} [${s.min ?? 0}, ${s.max ?? 100}]`
     case 'random_walk':

@@ -12,6 +12,7 @@ import {
   SOURCE_LABELS,
   areaGlobalAddr,
   formatValue,
+  hasScaleTransform,
   sourceSummary,
   type Area,
   type DataType,
@@ -90,13 +91,22 @@ function beginWrite(row: Point) {
   editingValue.value = row.area === 'coil' ? (v >= 0.5 ? 1 : 0) : v
 }
 
-/** 当前值单元格悬浮提示：写入口 / 只读区 / 未运行分别说明 */
+/** 当前值单元格悬浮提示：写入口 / 只读区 / 未运行分别说明 + 换算公式行（原始值核对用） */
 function valueCellTitle(p: Point): string {
-  if (!isMaster.value) return '仿真实时值'
-  if (!connRunning.value) return '连接未启动，无实时值'
-  if (!pointWritable(p)) return '只读区：Modbus 输入区（FC02/04）不可写，仅线圈/保持寄存器可写'
-  if (p.area === 'coil') return '点击写值下发（线圈为 0/1 开关量：0=分，≥0.5 一律按合=1，FC05）'
-  return '点击写值下发（自动选 FC06/FC10）'
+  let base: string
+  if (!isMaster.value) base = '仿真实时值（数据源产出工程值，寄存器自动按 (工程值−偏移量)÷系数 存原始值）'
+  else if (!connRunning.value) base = '连接未启动，无实时值'
+  else if (!pointWritable(p)) base = '只读区：Modbus 输入区（FC02/04）不可写，仅线圈/保持寄存器可写'
+  else if (p.area === 'coil') base = '点击写值下发（线圈为 0/1 开关量：0=分，≥0.5 一律按合=1，FC05）'
+  else base = '点击写值下发（自动选 FC06/FC10，输入工程值自动换算为原始值）'
+  if (!hasScaleTransform(p)) return base
+  const raw = store.raws[p.id]
+  const eng = store.values[p.id]
+  if (raw === undefined || eng === undefined) return base
+  const k = p.scale ?? 1
+  const b = p.offset ?? 0
+  const fmt = (n: number): string => (Number.isInteger(n) ? String(n) : n.toFixed(3))
+  return `${base}\n原始 ${fmt(raw)} × ${k} + ${b} = ${fmt(eng)}（工程值）`
 }
 
 async function commitWrite(row: Point) {
@@ -134,6 +144,9 @@ interface EditState {
   area: Area
   address: number
   dataType: DataType
+  /** 工程量换算：工程值 = 原始值 × 系数 + 偏移量（位区域禁用） */
+  scale: number
+  offset: number
   sourceKind: SourceKind
   params: Required<Pick<ValueSource, 'value' | 'period_s' | 'amplitude' | 'offset' | 'step' | 'min' | 'max'>>
   note: string
@@ -147,12 +160,17 @@ const edit = reactive<EditState>({
   area: 'input_register',
   address: 0,
   dataType: 'f32',
+  scale: 1,
+  offset: 0,
   sourceKind: 'sine',
   params: emptyParams(),
   note: '',
 })
 
 const editorOpen = ref(false)
+
+/** 编辑中的点位是否位区域（换算无意义，输入禁用） */
+const editIsBit = computed(() => edit.area === 'coil' || edit.area === 'discrete_input')
 
 function openEditor(p: Point | null) {
   if (p) {
@@ -161,6 +179,8 @@ function openEditor(p: Point | null) {
     edit.area = p.area
     edit.address = p.address
     edit.dataType = p.data_type
+    edit.scale = p.scale ?? 1
+    edit.offset = p.offset ?? 0
     edit.sourceKind = p.source.kind
     edit.params = { ...emptyParams(), ...p.source } as EditState['params']
     edit.note = p.note ?? ''
@@ -170,6 +190,8 @@ function openEditor(p: Point | null) {
     edit.area = 'input_register'
     edit.address = (device.value?.points.length ?? 0)
     edit.dataType = 'f32'
+    edit.scale = 1
+    edit.offset = 0
     edit.sourceKind = 'sine'
     edit.params = emptyParams()
     edit.note = ''
@@ -203,11 +225,22 @@ function applySource(): ValueSource {
 async function saveEditor() {
   const dev = device.value
   if (!dev) return
+  // 换算参数：位区域强制默认；数值容错（清空输入框时 v-model 给空串/NaN）
+  let scale = editIsBit.value ? 1 : Number(edit.scale)
+  let offset = editIsBit.value ? 0 : Number(edit.offset)
+  if (!Number.isFinite(scale)) scale = 1
+  if (!Number.isFinite(offset)) offset = 0
+  if (scale === 0) {
+    await uiAlert('系数不能为 0（工程值换算会除零）')
+    return
+  }
   const base = {
     name: edit.name.trim() || '未命名',
     area: edit.area,
     address: Math.max(0, Math.min(65535, Math.round(edit.address))),
     data_type: edit.dataType,
+    scale,
+    offset,
     source: applySource(),
     note: edit.note.trim() || undefined,
   }
@@ -242,6 +275,21 @@ const areaOptions = (Object.keys(AREA_LABELS) as Area[]).map((k) => ({
 }))
 const dataTypeOptions = (Object.keys(DATA_TYPE_LABELS) as DataType[]).map((k) => ({ label: DATA_TYPE_LABELS[k], value: k }))
 const sourceOptions = (Object.keys(SOURCE_LABELS) as SourceKind[]).map((k) => ({ label: SOURCE_LABELS[k], value: k }))
+
+/** 参数列摘要：数据源参数 + 换算标记（系数/偏移量非默认时） */
+function paramSummary(p: Point): string {
+  const s = sourceSummary(p.source)
+  if (!hasScaleTransform(p)) return s
+  const b = p.offset ?? 0
+  return `${s} · ×${p.scale}${b !== 0 ? ` ${b > 0 ? '+' : ''}${b}` : ''}`
+}
+
+/** 主机模式参数列：数据源不生效，只显示工程量换算（无可换算显示 —） */
+function convSummary(p: Point): string {
+  if (!hasScaleTransform(p)) return '—'
+  const b = p.offset ?? 0
+  return `×${p.scale}${b !== 0 ? ` ${b > 0 ? '+' : ''}${b}` : ''}`
+}
 
 // ---------- 点表导入导出（xlsx / CSV） ----------
 
@@ -425,12 +473,14 @@ async function onExport() {
             > ✎</span></span>
           </template>
         </vxe-column>
-        <vxe-column title="数据源" width="92">
+        <!-- 主机连接：数据源不生效（值来自设备采集），隐藏数据源列，参数列改为工程量换算 -->
+        <vxe-column v-if="!isMaster" title="数据源" width="92">
           <template #default="{ row }">{{ SOURCE_LABELS[row.source.kind as SourceKind] }}</template>
         </vxe-column>
-        <vxe-column title="参数" min-width="220">
+        <vxe-column :title="isMaster ? '换算' : '参数'" min-width="220">
           <template #default="{ row }">
-            <span class="mono dim">{{ sourceSummary(row.source as ValueSource) }}</span>
+            <span v-if="isMaster" class="mono dim" title="工程值 = 原始值 × 系数 + 偏移量">{{ convSummary(row as Point) }}</span>
+            <span v-else class="mono dim">{{ paramSummary(row as Point) }}</span>
           </template>
         </vxe-column>
         <vxe-column field="note" title="备注" min-width="120">
@@ -468,6 +518,27 @@ async function onExport() {
           <option v-for="o in dataTypeOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
         </select>
       </div>
+      <div class="f-row">
+        <span class="f-lab">系数</span>
+        <input
+          v-model.number="edit.scale"
+          type="number"
+          step="0.1"
+          :disabled="editIsBit"
+          :title="editIsBit ? '位区域（线圈/离散输入）为开关量，不参与换算' : '工程值 = 原始值 × 系数 + 偏移量'"
+        />
+        <span class="f-lab f-lab2">换算偏移</span>
+        <input
+          v-model.number="edit.offset"
+          type="number"
+          step="0.1"
+          :disabled="editIsBit"
+          :title="editIsBit ? '位区域（线圈/离散输入）为开关量，不参与换算' : '工程值 = 原始值 × 系数 + 偏移量'"
+        />
+      </div>
+      <div v-if="!editIsBit" class="tip">
+        工程值 = 原始值 × 系数 + 偏移量：主机采集按此显示工程值；从机寄存器自动存 (工程值 − 偏移量) ÷ 系数
+      </div>
       <label v-if="!isMaster" class="f-row">
         <span class="f-lab">数据源</span>
         <select v-model="edit.sourceKind">
@@ -482,7 +553,7 @@ async function onExport() {
         <template v-else-if="edit.sourceKind === 'sine'">
           <label class="f-row"><span class="f-lab">周期(s)</span><input v-model.number="edit.params.period_s" type="number" min="0.1" step="0.5" /></label>
           <label class="f-row"><span class="f-lab">幅值</span><input v-model.number="edit.params.amplitude" type="number" step="0.1" /></label>
-          <label class="f-row"><span class="f-lab">偏移</span><input v-model.number="edit.params.offset" type="number" step="0.1" /></label>
+          <label class="f-row"><span class="f-lab" title="波形基线（工程值口径），与点位换算偏移无关">基线</span><input v-model.number="edit.params.offset" type="number" step="0.1" /></label>
         </template>
         <template v-else-if="edit.sourceKind === 'ramp' || edit.sourceKind === 'random_walk'">
           <label class="f-row"><span class="f-lab">步长</span><input v-model.number="edit.params.step" type="number" min="0" step="0.1" /></label>
@@ -629,6 +700,14 @@ async function onExport() {
 .dim {
   color: var(--text-2);
   font-size: 11.5px;
+}
+
+/* 换算公式提示（编辑抽屉） */
+.tip {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--text-2);
+  line-height: 1.5;
 }
 
 .op {

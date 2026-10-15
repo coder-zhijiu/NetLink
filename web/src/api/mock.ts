@@ -1,6 +1,6 @@
 import type { NetLinkApi, RuntimePatch } from './contract'
 import type { Area, CanAgg, CanFrame, CanRxStat, DataType, Device, FrameRecord, Point, ProjectHandle, ProjectMeta, ProjectSpec, PointRow, ScanParams, ScanProgress, ScanRange, ScanResult, SheetParseResult, SourceKind, DevStat, Transport, TestConnResult } from '../types'
-import { canFrameNote, isCanTransport, isMasterTransport } from '../types'
+import { canFrameNote, engToRaw, isCanTransport, isMasterTransport, rawToEng } from '../types'
 import { parseCsvText, writeCsvText } from './point-sheet-csv'
 
 /**
@@ -199,6 +199,8 @@ export function createMockApi(): NetLinkApi {
   projects.set(currentFile, { spec: makeDemoProject(), savedAt: Date.now() })
   const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T
   const values = new Map<number, number>()
+  /** 寄存器原始值（与 Rust 端 DeviceRuntime.raws 同语义：从机 = 编码钳位后解回值；主机 = 采集原文） */
+  const raws = new Map<number, number>()
   /** 逐连接 / 逐设备运行状态（与 tauri 端 running_conns / running_devices 语义一致） */
   const runningConns = new Set<number>()
   const runningDevices = new Set<number>()
@@ -341,6 +343,7 @@ export function createMockApi(): NetLinkApi {
     if (paused || !running()) return
     const t = simMs / 1000
     const patch: Record<number, number> = {}
+    const rawsPatch: Record<number, number> = {}
     for (const conn of project?.connections ?? []) {
       if (isMasterTransport(conn.transport.kind)) continue // 主机设备由采集逻辑驱动
       if (!runningConns.has(conn.id)) continue
@@ -350,16 +353,19 @@ export function createMockApi(): NetLinkApi {
           const last = values.get(p.id) ?? (p.source.kind === 'ramp' ? (p.source.min ?? 0) : 0)
           const v = evalSource(p.source.kind, p.source as unknown as Record<string, number | undefined>, t, last)
           values.set(p.id, v)
+          const raw = registerRaw(v, p)
+          raws.set(p.id, raw)
           patch[p.id] = v
+          rawsPatch[p.id] = raw
         }
       }
     }
-    emit({ values: patch })
+    emit({ values: patch, raws: rawsPatch })
     tickMaster()
     tickCan()
   }
 
-  /** mock 主机采集：从同工程运行中的从机设备镜像值 + 采集健康统计 */
+  /** mock 主机采集：从同工程运行中的从机设备镜像寄存器原始值，按主机点位自己的换算参数显示工程值 */
   const tickMaster = () => {
     const conns = project?.connections ?? []
     const slaveDevs = conns
@@ -368,6 +374,7 @@ export function createMockApi(): NetLinkApi {
       .filter((d) => runningDevices.has(d.id))
     const slaveRunning = slaveDevs.length > 0
     const patch: Record<number, number> = {}
+    const rawsPatch: Record<number, number> = {}
     const statsPatch: Record<number, DevStat> = {}
     for (const conn of conns) {
       if (!isMasterTransport(conn.transport.kind) || !runningConns.has(conn.id)) continue
@@ -379,9 +386,13 @@ export function createMockApi(): NetLinkApi {
           for (const p of dev.points) {
             const src = source.points.find((sp) => sp.area === p.area && sp.address === p.address)
             if (src) {
-              const v = values.get(src.id) ?? 0
-              values.set(p.id, v)
-              patch[p.id] = v
+              // 主机读到的是从机寄存器原文，再按主机点位的系数/偏移量换算成工程值
+              const raw = raws.get(src.id) ?? registerRaw(values.get(src.id) ?? 0, src)
+              const eng = rawToEng(raw, p.area, p.scale, p.offset)
+              values.set(p.id, eng)
+              raws.set(p.id, raw)
+              patch[p.id] = eng
+              rawsPatch[p.id] = raw
             }
           }
           st.last_ok_ms = Date.now()
@@ -393,7 +404,7 @@ export function createMockApi(): NetLinkApi {
       }
     }
     if (Object.keys(statsPatch).length > 0) {
-      emit({ values: patch, stats: statsPatch })
+      emit({ values: patch, raws: rawsPatch, stats: statsPatch })
     }
   }
 
@@ -444,6 +455,41 @@ export function createMockApi(): NetLinkApi {
 
   const wordsOf = (dt: DataType): number => (dt === 'u16' || dt === 'i16' ? 1 : dt === 'u32' || dt === 'i32' || dt === 'f32' ? 2 : 4)
 
+  /** 与 Rust runtime::decode_words 同构（u64/i64 按演示兜底走 f64 位型，与上方 encodeWords 对称） */
+  const decodeWords = (ws: number[], dt: DataType): number => {
+    switch (dt) {
+      case 'u16':
+        return ws[0] ?? 0
+      case 'i16':
+        return new Int16Array(new Uint16Array([ws[0] ?? 0]).buffer)[0]
+      case 'u32':
+        return (((ws[0] ?? 0) << 16) | (ws[1] ?? 0)) >>> 0
+      case 'i32':
+        return new Int32Array(new Uint32Array([(((ws[0] ?? 0) << 16) | (ws[1] ?? 0)) >>> 0]).buffer)[0]
+      case 'f32': {
+        const b = new ArrayBuffer(4)
+        new DataView(b).setUint16(0, ws[0] ?? 0)
+        new DataView(b).setUint16(2, ws[1] ?? 0)
+        return new DataView(b).getFloat32(0)
+      }
+      default: {
+        const b = new ArrayBuffer(8)
+        const dv = new DataView(b)
+        dv.setUint16(0, ws[0] ?? 0)
+        dv.setUint16(2, ws[1] ?? 0)
+        dv.setUint16(4, ws[2] ?? 0)
+        dv.setUint16(6, ws[3] ?? 0)
+        return dv.getFloat64(0)
+      }
+    }
+  }
+
+  /** 从机工程值 → 寄存器实际内容（换算 + 编码钳位/取整后解回，tooltip 保真） */
+  const registerRaw = (eng: number, p: Point): number => {
+    if (p.area === 'coil' || p.area === 'discrete_input') return eng >= 0.5 ? 1 : 0
+    return decodeWords(encodeWords(engToRaw(eng, p.area, p.scale, p.offset), p.data_type), p.data_type)
+  }
+
   /** 镜像从机（同工程里运行中的从机设备，按 slave_id 匹配——与 tickMaster 同款配对） */
   const findMirrorSlave = (unit: number): Device | null => {
     const slaves = (project?.connections ?? [])
@@ -465,13 +511,13 @@ export function createMockApi(): NetLinkApi {
         const from = Math.max(p.address, params.start_addr)
         const to = Math.min(p.address + slots - 1, params.end_addr)
         if (from > to) continue
-        // 逐槽位取值：位区按点值 0/1；字区按数据类型编码（跨点重叠取先到的）
+        // 逐槽位取值：位区按点值 0/1；字区按数据类型编码原始值（跨点重叠取先到的）
         const vals: number[] = []
         for (let a = from; a <= to; a++) {
           if (area === 'coil' || area === 'discrete_input') {
             vals.push((values.get(p.id) ?? 0) >= 0.5 ? 1 : 0)
           } else {
-            const ws = encodeWords(values.get(p.id) ?? 0, p.data_type)
+            const ws = encodeWords(engToRaw(values.get(p.id) ?? 0, p.area, p.scale, p.offset), p.data_type)
             vals.push(ws[a - p.address] ?? 0)
           }
         }
@@ -788,22 +834,39 @@ export function createMockApi(): NetLinkApi {
       }
       // 线圈按 Modbus 语义归一化为 0/1（≥0.5 = 合）
       if (pt.area === 'coil') value = value >= 0.5 ? 1 : 0
-      values.set(pointId, value)
-      // 静态源：写入成为新的静态值（与 Rust 引擎语义一致，tick 不打回）
-      if (pt.source.kind === 'static') pt.source.value = value
-      const patch: Record<number, number> = { [pointId]: value }
-      // mock 闭环：镜像更新对应从机点位，下一轮采集读到新值
+      const patch: Record<number, number> = {}
+      const rawsPatch: Record<number, number> = {}
       const isMasterDev = conns.some((c) => isMasterTransport(c.transport.kind) && c.devices.some((d) => d.id === deviceId))
       if (isMasterDev) {
+        // 主机写：输入工程值 → 逆变换为寄存器原始值下发
+        const raw = engToRaw(value, pt.area, pt.scale, pt.offset)
         const slaveDevs = conns.filter((c) => c.transport.kind === 'tcp_server').flatMap((c) => c.devices)
         const src = slaveDevs.find((s) => s.slave_id === dev.slave_id)?.points.find((sp) => sp.area === pt.area && sp.address === pt.address)
         if (src) {
-          values.set(src.id, value)
-          if (src.source.kind === 'static') src.source.value = value
-          patch[src.id] = value
+          // 镜像从机寄存器收到原始值；静态工程值按从机自己的换算参数解回（tick 不打回）
+          const engSlave = rawToEng(raw, src.area, src.scale, src.offset)
+          values.set(src.id, engSlave)
+          raws.set(src.id, registerRaw(engSlave, src))
+          if (src.source.kind === 'static') src.source.value = engSlave
+          patch[src.id] = engSlave
+          rawsPatch[src.id] = raws.get(src.id) ?? raw
         }
+        // 主机侧按回读口径显示（下一轮采集自然校准）
+        const back = rawToEng(raw, pt.area, pt.scale, pt.offset)
+        values.set(pointId, back)
+        raws.set(pointId, raw)
+        patch[pointId] = back
+        rawsPatch[pointId] = raw
+      } else {
+        // 从机侧（本工具内直写仿真值）：输入工程值，静态源更新为该值
+        values.set(pointId, value)
+        const raw = registerRaw(value, pt)
+        raws.set(pointId, raw)
+        if (pt.source.kind === 'static') pt.source.value = value
+        patch[pointId] = value
+        rawsPatch[pointId] = raw
       }
-      emit({ values: patch })
+      emit({ values: patch, raws: rawsPatch })
     },
     async sendTestFrame(connId, unit, hexStr) {
       const clean = hexStr.replace(/[^0-9a-fA-F]/g, '')

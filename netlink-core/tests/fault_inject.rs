@@ -24,6 +24,8 @@ fn device_with(fault: FaultConfig) -> Device {
             area: Area::HoldingRegister,
             address: 0,
             data_type: DataType::F32,
+            scale: 1.0,
+            offset: 0.0,
             source: ValueSource::Static { value: 250.0 },
             note: None,
         }],

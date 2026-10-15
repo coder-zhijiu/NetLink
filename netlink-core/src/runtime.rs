@@ -97,7 +97,10 @@ pub struct DeviceRuntime {
     /// 最近一次采集失败原因（成功采集后清空；仅主机侧维护）
     pub last_error: Option<String>,
     points: Vec<PointRuntime>,
+    /// 工程值（从机 = 仿真值；主机 = 采集换算后的显示值）
     values: Vec<f64>,
+    /// 寄存器原始值（tooltip 调试用；从机 = 编码后解回值含钳位，主机 = 采集原文）
+    raws: Vec<f64>,
     blocks: Blocks,
 }
 
@@ -106,6 +109,8 @@ struct PointRuntime {
     area: Area,
     address: u16,
     data_type: DataType,
+    scale: f64,
+    offset: f64,
     source: ValueSource,
 }
 
@@ -129,9 +134,30 @@ impl Blocks {
     }
 }
 
+/// 工程值换算（主从对称，一套公式两边用）：
+/// - 主机采集显示：工程值 = 原始值 × 系数 + 偏移量（raw_to_eng）
+/// - 从机寄存器编码 / 主机写点下发：原始值 = (工程值 − 偏移量) ÷ 系数（eng_to_raw）
+///
+/// 位区域（线圈/离散输入）为开关量不换算；恒等参数（1/0）原样返回避免浮点误差；
+/// 系数为 0 时按 1 兜底防除零（编辑器与点表导入已拒绝 0，此处仅防御手改工程文件）。
+pub fn raw_to_eng(raw: f64, area: Area, scale: f64, offset: f64) -> f64 {
+    if area.is_bit() || (scale == 1.0 && offset == 0.0) {
+        return raw;
+    }
+    let k = if scale == 0.0 { 1.0 } else { scale };
+    raw * k + offset
+}
+
+pub fn eng_to_raw(v: f64, area: Area, scale: f64, offset: f64) -> f64 {
+    if area.is_bit() || (scale == 1.0 && offset == 0.0) {
+        return v;
+    }
+    let k = if scale == 0.0 { 1.0 } else { scale };
+    (v - offset) / k
+}
+
 /// f64 值按数据类型编码为若干 16 位字（大端字序，符合 Modbus 惯例）
-pub fn encode_words(v: f64, dt: DataType) -> Vec<u16> {
-    match dt {
+pub fn encode_words(v: f64, dt: DataType) -> Vec<u16> {    match dt {
         DataType::U16 => vec![v.clamp(0.0, 65535.0).round() as u16],
         DataType::I16 => vec![(v.clamp(-32768.0, 32767.0).round() as i16) as u16],
         DataType::U32 => {
@@ -182,6 +208,8 @@ impl DeviceRuntime {
                 area: p.area,
                 address: p.address,
                 data_type: p.data_type,
+                scale: p.scale,
+                offset: p.offset,
                 source: p.source.clone(),
             })
             .collect();
@@ -206,6 +234,7 @@ impl DeviceRuntime {
                     _ => 0.0,
                 })
                 .collect(),
+            raws: vec![0.0; dev.points.len()],
             blocks: Blocks::default(),
         };
         rt.rebuild_blocks();
@@ -235,13 +264,20 @@ impl DeviceRuntime {
             let v = self.values[i];
             if p.area.is_bit() {
                 let bit = v >= 0.5;
+                self.raws[i] = if bit { 1.0 } else { 0.0 };
                 match p.area {
                     Area::Coil => self.blocks.coil[p.address as usize] = bit,
                     Area::DiscreteInput => self.blocks.discrete[p.address as usize] = bit,
                     _ => unreachable!(),
                 }
             } else {
-                let words = encode_words(v, p.data_type);
+                // 从机编码：寄存器存换算后的原始值；raws 记编码解回值（含钳位/取整，保真）
+                let words = encode_words(eng_to_raw(v, p.area, p.scale, p.offset), p.data_type);
+                let mut buf = [0u16; 4];
+                for (k, w) in words.iter().enumerate() {
+                    buf[k] = *w;
+                }
+                self.raws[i] = decode_words(&buf, p.data_type);
                 let base = p.address as usize;
                 match p.area {
                     Area::HoldingRegister => {
@@ -274,6 +310,15 @@ impl DeviceRuntime {
             .collect()
     }
 
+    /// 全部点位寄存器原始值（id, raw）——实时值列悬浮换算提示用
+    pub fn snapshot_raws(&self) -> Vec<(u64, f64)> {
+        self.points
+            .iter()
+            .zip(self.raws.iter())
+            .map(|(p, v)| (p.id, *v))
+            .collect()
+    }
+
     /// 主机写入线圈：更新块缓存；静态源点位同步改值（写入成为新的静态值）
     pub fn write_coils(&mut self, addr: u16, bits: &[bool]) {
         for (k, b) in bits.iter().enumerate() {
@@ -287,7 +332,9 @@ impl DeviceRuntime {
             if p.area == Area::Coil && p.source.is_static() {
                 let a = p.address as usize;
                 if a >= addr as usize && a < addr as usize + bits.len() {
-                    updates.push((i, if bits[a - addr as usize] { 1.0 } else { 0.0 }));
+                    let v = if bits[a - addr as usize] { 1.0 } else { 0.0 };
+                    self.raws[i] = v;
+                    updates.push((i, v));
                 }
             }
         }
@@ -307,7 +354,7 @@ impl DeviceRuntime {
                 self.blocks.holding[a] = *w;
             }
         }
-        // 静态源点位：写入的字重解码为值，且写入成为新的静态值（tick 不再打回）
+        // 静态源点位：写入的字重解码为原始值再换算成工程值，且写入成为新的静态值（tick 不再打回）
         let mut updates: Vec<(usize, f64)> = Vec::new();
         for (i, p) in self.points.iter().enumerate() {
             if p.area == Area::HoldingRegister && p.source.is_static() {
@@ -325,7 +372,9 @@ impl DeviceRuntime {
                         };
                         buf[k] = val;
                     }
-                    updates.push((i, decode_words(&buf, p.data_type)));
+                    let raw = decode_words(&buf, p.data_type);
+                    self.raws[i] = raw;
+                    updates.push((i, raw_to_eng(raw, p.area, p.scale, p.offset)));
                 }
             }
         }
@@ -366,7 +415,10 @@ impl DeviceRuntime {
             for k in 0..n {
                 buf[k] = self.reg_view(area)[base + k];
             }
-            self.values[i] = decode_words(&buf, p.data_type);
+            // 主机采集：raws 记寄存器原文，values 换算成工程值
+            let raw = decode_words(&buf, p.data_type);
+            self.raws[i] = raw;
+            self.values[i] = raw_to_eng(raw, p.area, p.scale, p.offset);
         }
     }
 
@@ -392,7 +444,9 @@ impl DeviceRuntime {
             }
             let a = p.address as usize;
             if a >= start as usize && a < start as usize + bits.len() {
-                self.values[i] = if bits[a - start as usize] { 1.0 } else { 0.0 };
+                let v = if bits[a - start as usize] { 1.0 } else { 0.0 };
+                self.raws[i] = v;
+                self.values[i] = v;
             }
         }
     }
@@ -413,12 +467,12 @@ impl DeviceRuntime {
             .collect()
     }
 
-    /// 按点位 id 查布局（写命令用）
-    pub fn point_info(&self, point_id: u64) -> Option<(Area, u16, DataType)> {
+    /// 按点位 id 查布局与换算参数（写命令用：输入工程值 → 逆变换下发）
+    pub fn point_info(&self, point_id: u64) -> Option<(Area, u16, DataType, f64, f64)> {
         self.points
             .iter()
             .find(|p| p.id == point_id)
-            .map(|p| (p.area, p.address, p.data_type))
+            .map(|p| (p.area, p.address, p.data_type, p.scale, p.offset))
     }
 
     /// 本轮采集成功
@@ -900,6 +954,20 @@ impl RuntimeManager {
                 let d = dev.lock().unwrap();
                 if d.id == device_id {
                     return d.snapshot_values();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// 选中设备的寄存器原始值（实时值悬浮换算提示用，与 values 同节奏推送）
+    pub fn snapshot_raws(&self, device_id: u64) -> Vec<(u64, f64)> {
+        let conns = self.inner.conns.lock().unwrap();
+        for state in conns.values() {
+            for dev in &state.devices {
+                let d = dev.lock().unwrap();
+                if d.id == device_id {
+                    return d.snapshot_raws();
                 }
             }
         }

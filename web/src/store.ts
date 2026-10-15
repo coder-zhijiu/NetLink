@@ -16,6 +16,8 @@ export const store = reactive({
   selectedDeviceId: null as number | null,
   frames: [] as FrameRecord[],
   values: {} as Record<number, number>,
+  /** 寄存器原始值（实时值悬浮换算提示用，与 values 同节奏推送） */
+  raws: {} as Record<number, number>,
   /** 主机侧采集健康统计（device_id → stat） */
   stats: {} as Record<number, DevStat>,
   /** 主机连接链路状态（conn_id → 状态；替换式，连接停止后消失） */
@@ -69,6 +71,7 @@ export function applyProjectHandle(h: ProjectHandle) {
   savedSnapshot = JSON.stringify(h.spec)
   store.frames.length = 0
   store.values = {}
+  store.raws = {}
   store.stats = {}
   store.connStates = {}
   store.canRx = {}
@@ -204,6 +207,7 @@ export function applyUpdate(patch: RuntimePatch) {
     while (store.frames.length > FRAME_LIMIT) store.frames.shift()
   }
   if (patch.values) Object.assign(store.values, patch.values)
+  if (patch.raws) Object.assign(store.raws, patch.raws)
   if (patch.stats) Object.assign(store.stats, patch.stats)
   if (patch.running !== undefined) store.running = patch.running
   if (patch.running_conns) store.runningConns = patch.running_conns

@@ -1,12 +1,15 @@
 //! 点表导入导出：CSV / xlsx ↔ 点位行。
 //!
-//! 列格式（13 列，中文表头，Excel 友好）：
-//! 名称 | 区域 | 地址 | 类型 | 数据源 | 静态值 | 周期(秒) | 幅值 | 偏移 | 步长 | 下限 | 上限 | 备注
+//! 列格式（15 列，中文表头，Excel 友好）：
+//! 名称 | 区域 | 地址 | 类型 | 数据源 | 静态值 | 周期(秒) | 幅值 | 偏移 | 步长 | 下限 | 上限 | 系数 | 换算偏移 | 备注
 //!
 //! - 区域 / 数据源接受中文或英文枚举名（导出写中文）；
 //! - 地址为 0 基十进制（与点表界面一致）；
 //! - 数据源参数按类型取用对应列，空单元格用模型默认值；
-//! - 解析容错：坏行不中断整批，逐行收集错误报告。
+//! - 「偏移」列是正弦波形的基线参数，「换算偏移」是工程量换算偏移，二者同名不同义；
+//! - 解析按表头名映射列（首行识别为表头时）：列序自由、未知列忽略、
+//!   旧 13 列文件缺「系数/换算偏移」按默认 1/0 处理；无表头文件按 15 列位置解析；
+//! - 解析容错：坏行不中断整批，逐行收集错误报告；系数为 0 报行错误（换算会除零）。
 
 use std::io::Cursor;
 
@@ -15,6 +18,13 @@ use serde::Serialize;
 
 use crate::model::{Area, DataType as ModelDataType, Point, ValueSource};
 
+fn d_scale() -> f64 {
+    1.0
+}
+fn d_offset() -> f64 {
+    0.0
+}
+
 /// 一行点位（Point 减 id；导入时由前端分配 id 保持全工程唯一）
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct PointRow {
@@ -22,6 +32,12 @@ pub struct PointRow {
     pub area: Area,
     pub address: u16,
     pub data_type: ModelDataType,
+    /// 工程量换算系数（0 报错；位区域不适用）
+    #[serde(default = "d_scale")]
+    pub scale: f64,
+    /// 工程量换算偏移量（区别于正弦源基线）
+    #[serde(default = "d_offset")]
+    pub offset: f64,
     pub source: ValueSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -34,6 +50,8 @@ impl From<&Point> for PointRow {
             area: p.area,
             address: p.address,
             data_type: p.data_type,
+            scale: p.scale,
+            offset: p.offset,
             source: p.source.clone(),
             note: p.note.clone(),
         }
@@ -56,9 +74,66 @@ pub struct SheetRowError {
 
 // ---------- 列定义 ----------
 
-pub const HEADERS: [&str; 13] = [
-    "名称", "区域", "地址", "类型", "数据源", "静态值", "周期(秒)", "幅值", "偏移", "步长", "下限", "上限", "备注",
+pub const HEADERS: [&str; 15] = [
+    "名称", "区域", "地址", "类型", "数据源", "静态值", "周期(秒)", "幅值", "偏移", "步长", "下限", "上限", "系数", "换算偏移", "备注",
 ];
+
+/// 逻辑列（声明顺序 = 无表头文件的位置序）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Col {
+    Name,
+    Area,
+    Addr,
+    Type,
+    Source,
+    Value,
+    Period,
+    Amplitude,
+    SineOffset,
+    Step,
+    Min,
+    Max,
+    Scale,
+    EngOffset,
+    Note,
+}
+
+impl Col {
+    fn label(self) -> &'static str {
+        HEADERS[self as usize]
+    }
+}
+
+/// 表头单元格文本 → 逻辑列（中文导出名为主，兼容常见别名）
+fn header_col(h: &str) -> Option<Col> {
+    match h.trim() {
+        "名称" | "name" | "点名称" => Some(Col::Name),
+        "区域" => Some(Col::Area),
+        "地址" => Some(Col::Addr),
+        "类型" => Some(Col::Type),
+        "数据源" => Some(Col::Source),
+        "静态值" => Some(Col::Value),
+        "周期(秒)" | "周期（秒）" | "周期" => Some(Col::Period),
+        "幅值" => Some(Col::Amplitude),
+        "偏移" => Some(Col::SineOffset),
+        "步长" => Some(Col::Step),
+        "下限" => Some(Col::Min),
+        "上限" => Some(Col::Max),
+        "系数" => Some(Col::Scale),
+        "换算偏移" | "偏移量" => Some(Col::EngOffset),
+        "备注" => Some(Col::Note),
+        _ => None,
+    }
+}
+
+/// 首行是否为表头行（第 1 列可识别时按表头名映射列）
+fn is_header_row(first: &[String]) -> bool {
+    let h = cell(first, 0).trim();
+    h == "名称" || h.eq_ignore_ascii_case("name") || h == "点名称"
+}
+
+/// 表头名映射生效所需的必需列
+const REQUIRED_COLS: [Col; 5] = [Col::Name, Col::Area, Col::Addr, Col::Type, Col::Source];
 
 const AREA_CN: [(Area, &str); 4] = [
     (Area::Coil, "线圈"),
@@ -145,54 +220,101 @@ fn parse_u16(s: &str) -> Result<u16, String> {
 
 // ---------- 行 ↔ 单元格 ----------
 
-/// 一行字符串单元格 → PointRow（失败给出人话原因）
-pub fn row_to_point(cells: &[String]) -> Result<PointRow, String> {
-    let name = cell(cells, 0).trim().to_string();
+/// 列取值视图：表头名映射（map = 表头行各位置的逻辑列，未知列 None）或 15 列位置式。
+/// 必需列（名称/区域/地址/类型/数据源）缺表头时报行错误；参数列缺表头按默认值。
+struct ColView<'a> {
+    cells: &'a [String],
+    map: Option<&'a [Option<Col>]>,
+}
+
+impl ColView<'_> {
+    /// 按逻辑列取必需单元格文本；表头映射模式下表头缺列报错（位置式空串交给值解析器报错）
+    fn get(&self, col: Col) -> Result<&str, String> {
+        match self.map {
+            None => Ok(cell(self.cells, col as usize)),
+            Some(map) => match map.iter().position(|c| *c == Some(col)) {
+                Some(i) => Ok(cell(self.cells, i)),
+                None => Err(format!("表头缺少「{}」列", col.label())),
+            },
+        }
+    }
+
+    /// 按逻辑列取可选单元格文本；表头缺列或单元格缺失给空串（按默认值）
+    fn get_opt(&self, col: Col) -> &str {
+        match self.map {
+            None => cell(self.cells, col as usize),
+            Some(map) => match map.iter().position(|c| *c == Some(col)) {
+                Some(i) => cell(self.cells, i),
+                None => "",
+            },
+        }
+    }
+}
+
+/// 一行字符串单元格 → PointRow（失败给出人话原因）。
+/// map = None 按 15 列位置解析；Some 按表头名映射（见 parse_sheet）
+fn row_to_point_ex(cells: &[String], map: Option<&[Option<Col>]>) -> Result<PointRow, String> {
+    let view = ColView { cells, map };
+    let name = view.get(Col::Name)?.trim().to_string();
     if name.is_empty() {
         return Err("名称为空".to_string());
     }
-    let area = parse_area(cell(cells, 1))?;
-    let address = parse_u16(cell(cells, 2))?;
-    let data_type = parse_data_type(cell(cells, 3))?;
-    let kind = parse_source_kind(cell(cells, 4))?;
+    let area = parse_area(view.get(Col::Area)?)?;
+    let address = parse_u16(view.get(Col::Addr)?)?;
+    let data_type = parse_data_type(view.get(Col::Type)?)?;
+    let kind = parse_source_kind(view.get(Col::Source)?)?;
 
-    // 参数列按数据源取用；空单元格用模型默认值，坏数字报行错误（不静默换默认）
-    let get_f = |idx: usize, col: &str, default: f64| -> Result<f64, String> {
-        let s = cell(cells, idx).trim();
+    // 参数列按数据源取用；表头缺列或空单元格用模型默认值，坏数字报行错误（不静默换默认）
+    let get_f = |col: Col, default: f64| -> Result<f64, String> {
+        let s = view.get_opt(col).trim();
         if s.is_empty() {
             return Ok(default);
         }
-        s.parse::<f64>().map_err(|_| format!("{col}列「{s}」不是数字"))
+        s.parse::<f64>().map_err(|_| format!("{}列「{s}」不是数字", col.label()))
     };
-    let value = get_f(5, "静态值", 0.0)?;
-    let period = get_f(6, "周期", 10.0)?;
-    let amplitude = get_f(7, "幅值", 1.0)?;
-    let offset = get_f(8, "偏移", 0.0)?;
-    let step = get_f(9, "步长", 1.0)?;
-    let min = get_f(10, "下限", 0.0)?;
-    let max = get_f(11, "上限", 100.0)?;
+    let value = get_f(Col::Value, 0.0)?;
+    let period = get_f(Col::Period, 10.0)?;
+    let amplitude = get_f(Col::Amplitude, 1.0)?;
+    let sine_offset = get_f(Col::SineOffset, 0.0)?;
+    let step = get_f(Col::Step, 1.0)?;
+    let min = get_f(Col::Min, 0.0)?;
+    let max = get_f(Col::Max, 100.0)?;
+    let scale = get_f(Col::Scale, 1.0)?;
+    let offset = get_f(Col::EngOffset, 0.0)?;
+    // 位区域是开关量，换算无意义（导入按默认；编辑器里也禁用）
+    let (scale, offset) = if area.is_bit() { (1.0, 0.0) } else { (scale, offset) };
+    if scale == 0.0 {
+        return Err("系数不能为 0（工程值换算会除零）".to_string());
+    }
 
     let source = match kind.as_str() {
         "static" => ValueSource::Static { value },
-        "sine" => ValueSource::Sine { period_s: period, amplitude, offset },
+        "sine" => ValueSource::Sine { period_s: period, amplitude, offset: sine_offset },
         "ramp" => ValueSource::Ramp { step, min, max },
         "random_walk" => ValueSource::RandomWalk { step, min, max },
         "swing" => ValueSource::Swing { min, max, period_s: period },
         _ => unreachable!(),
     };
 
-    let note = cell(cells, 12).trim();
+    let note = view.get_opt(Col::Note).trim();
     Ok(PointRow {
         name,
         area,
         address,
         data_type,
+        scale,
+        offset,
         source,
         note: if note.is_empty() { None } else { Some(note.to_string()) },
     })
 }
 
-/// PointRow → 一行单元格（含备注）
+/// 一行字符串单元格 → PointRow（15 列位置式；表头映射入口见 parse_sheet）
+pub fn row_to_point(cells: &[String]) -> Result<PointRow, String> {
+    row_to_point_ex(cells, None)
+}
+
+/// PointRow → 一行单元格（含换算列与备注）
 pub fn point_to_cells(r: &PointRow) -> Vec<String> {
     let mut cells = vec![
         r.name.clone(),
@@ -203,6 +325,10 @@ pub fn point_to_cells(r: &PointRow) -> Vec<String> {
     ];
     let params = source_params(&r.source);
     cells.extend(params);
+    // 换算列：位区域或恒等参数留空（导入按默认 1/0，表格更干净）
+    let identity = r.scale == 1.0 && r.offset == 0.0;
+    cells.push(if r.area.is_bit() || identity { String::new() } else { trim_num(r.scale) });
+    cells.push(if r.area.is_bit() || identity { String::new() } else { trim_num(r.offset) });
     cells.push(r.note.clone().unwrap_or_default());
     cells
 }
@@ -253,22 +379,30 @@ fn trim_num(x: f64) -> String {
 
 // ---------- 表级：字符串行集合 ↔ SheetParseResult ----------
 
-/// 全部字符串行 → 解析结果。首行若是表头（第 1 列为「名称」或 name）则跳过。
+/// 全部字符串行 → 解析结果。首行识别为表头且 5 个必需列齐备时按表头名映射
+/// （列序自由、未知列忽略、旧 13 列文件缺换算列按默认）；表头残缺或无表头按
+/// 15 列位置解析（残缺表头仍跳过首行，与旧版行为一致）。
 pub fn parse_sheet(raw_rows: &[Vec<String>]) -> SheetParseResult {
     let mut result = SheetParseResult::default();
-    let start = raw_rows
-        .first()
-        .map(|first| {
-            let h = cell(first, 0).trim();
-            h == "名称" || h.eq_ignore_ascii_case("name") || h == "点名称"
-        })
-        .unwrap_or(false) as usize;
+    let Some(first) = raw_rows.first() else {
+        return result;
+    };
+    let mut start = 0;
+    let mut map: Option<Vec<Option<Col>>> = None;
+    if is_header_row(first) {
+        start = 1;
+        let m: Vec<Option<Col>> = first.iter().map(|h| header_col(h)).collect();
+        let complete = REQUIRED_COLS.iter().all(|c| m.contains(&Some(*c)));
+        if complete {
+            map = Some(m);
+        }
+    }
     for (i, cells) in raw_rows.iter().enumerate().skip(start) {
         let line = (i + 1) as u32; // 物理行号（含表头，1 起始）
         if cells.iter().all(|c| c.trim().is_empty()) {
             continue; // 空行跳过
         }
-        match row_to_point(cells) {
+        match row_to_point_ex(cells, map.as_deref()) {
             Ok(row) => result.rows.push(row),
             Err(reason) => result.errors.push(SheetRowError { line, reason }),
         }
@@ -359,7 +493,9 @@ pub fn write_xlsx(rows: &[PointRow]) -> Result<Vec<u8>, String> {
     let mut book = Workbook::new();
     let sheet = book.add_worksheet().set_name("点表").map_err(|e| e.to_string())?;
     // 列宽：名称/参数列适中
-    let widths = [22.0, 12.0, 8.0, 8.0, 12.0, 10.0, 10.0, 8.0, 8.0, 8.0, 8.0, 10.0, 24.0];
+    let widths = [
+        22.0, 12.0, 8.0, 8.0, 12.0, 10.0, 10.0, 8.0, 8.0, 8.0, 8.0, 10.0, 8.0, 10.0, 24.0,
+    ];
     for (i, w) in widths.iter().enumerate() {
         let _ = sheet.set_column_width(i as u16, *w);
     }
@@ -388,6 +524,8 @@ mod tests {
                 area: Area::InputRegister,
                 address: 0,
                 data_type: ModelDataType::F32,
+                scale: 0.1,
+                offset: 0.0,
                 source: ValueSource::Sine { period_s: 60.0, amplitude: 5.0, offset: 220.0 },
                 note: Some("进线".to_string()),
             },
@@ -396,6 +534,8 @@ mod tests {
                 area: Area::Coil,
                 address: 1,
                 data_type: ModelDataType::U16,
+                scale: 1.0,
+                offset: 0.0,
                 source: ValueSource::Static { value: 1.0 },
                 note: None,
             },
@@ -404,6 +544,8 @@ mod tests {
                 area: Area::HoldingRegister,
                 address: 20,
                 data_type: ModelDataType::F64,
+                scale: 1.0,
+                offset: 0.0,
                 source: ValueSource::Ramp { step: 0.05, min: 0.0, max: 999999.0 },
                 note: None,
             },
@@ -433,13 +575,73 @@ mod tests {
 
     #[test]
     fn csv_write_then_manual_parse() {
-        // 导出的 CSV 手动核对列内容（表头 + 数据行）
+        // 导出的 CSV 手动核对列内容（表头 + 数据行；换算列在备注前，恒等参数留空）
         let bytes = write_csv(&sample());
         let text = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').to_string();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "名称,区域,地址,类型,数据源,静态值,周期(秒),幅值,偏移,步长,下限,上限,备注");
-        assert_eq!(lines[1], "A相电压,输入寄存器,0,f32,正弦,,60,5,220,,,,进线");
-        assert_eq!(lines[2], "遥信合位,线圈,1,u16,静态,1,,,,,,,");
+        assert_eq!(
+            lines[0],
+            "名称,区域,地址,类型,数据源,静态值,周期(秒),幅值,偏移,步长,下限,上限,系数,换算偏移,备注"
+        );
+        assert_eq!(lines[1], "A相电压,输入寄存器,0,f32,正弦,,60,5,220,,,,0.1,0,进线");
+        assert_eq!(lines[2], "遥信合位,线圈,1,u16,静态,1,,,,,,,,,");
+    }
+
+    #[test]
+    fn old_13_col_header_still_imports() {
+        // v1.1 及更早导出的 13 列文件（末列是备注）：表头无「系数/换算偏移」→ 按默认 1/0 导入
+        let mut old_header: Vec<String> = HEADERS[..12].iter().map(|s| s.to_string()).collect();
+        old_header.push("备注".to_string());
+        let raw = vec![
+            old_header,
+            vec!["A相电压".to_string(), "输入寄存器".to_string(), "0".to_string(), "f32".to_string(), "正弦".to_string(), "".to_string(), "60".to_string(), "5".to_string(), "220".to_string(), "".to_string(), "".to_string(), "".to_string(), "进线".to_string()],
+        ];
+        let r = parse_sheet(&raw);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].scale, 1.0);
+        assert_eq!(r.rows[0].offset, 0.0);
+        assert_eq!(r.rows[0].note.as_deref(), Some("进线"));
+    }
+
+    #[test]
+    fn header_mapping_column_order_free() {
+        // 按表头名映射：列序打乱 + 未知列（「厂家」）忽略，照样解析
+        let raw = vec![
+            vec!["名称".to_string(), "系数".to_string(), "厂家".to_string(), "地址".to_string(), "区域".to_string(), "类型".to_string(), "数据源".to_string(), "静态值".to_string(), "换算偏移".to_string(), "备注".to_string()],
+            vec!["电压".to_string(), "0.01".to_string(), "Solis".to_string(), "5".to_string(), "输入寄存器".to_string(), "u16".to_string(), "静态".to_string(), "2200".to_string(), "-10".to_string(), "电网".to_string()],
+        ];
+        let r = parse_sheet(&raw);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.rows.len(), 1);
+        let row = &r.rows[0];
+        assert_eq!(row.name, "电压");
+        assert_eq!(row.area, Area::InputRegister);
+        assert_eq!(row.address, 5);
+        assert_eq!(row.data_type, ModelDataType::U16);
+        assert_eq!(row.source, ValueSource::Static { value: 2200.0 });
+        assert_eq!(row.scale, 0.01);
+        assert_eq!(row.offset, -10.0);
+        assert_eq!(row.note.as_deref(), Some("电网"));
+    }
+
+    #[test]
+    fn zero_scale_rejected_and_bit_scale_ignored() {
+        let mk = |scale: &str, area: &str| -> Vec<Vec<String>> {
+            vec![
+                HEADERS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                vec!["v".to_string(), area.to_string(), "0".to_string(), "u16".to_string(), "静态".to_string(), "1".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string(), scale.to_string(), "".to_string(), "".to_string()],
+            ]
+        };
+        // 系数 0 报行错误（换算会除零）
+        let r = parse_sheet(&mk("0", "输入寄存器"));
+        assert_eq!(r.rows.len(), 0);
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].reason.contains("系数不能为 0"));
+        // 位区域是开关量：系数单元格有值也按默认 1 导入
+        let r = parse_sheet(&mk("0.1", "线圈"));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.rows[0].scale, 1.0);
     }
 
     #[test]

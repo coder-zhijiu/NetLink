@@ -451,7 +451,8 @@ fn build_write_pdu(area: Area, addr: u16, dt: DataType, value: f64) -> Result<Ve
     }
 }
 
-/// 写应答导入本地缓存（下轮轮询自然校准）；TCP 与 RTU 主机共用
+/// 写应答导入本地缓存（值参数 = 已逆变换的寄存器原始值，导入路径再换算回工程值；
+/// 下轮轮询自然校准）；TCP 与 RTU 主机共用
 fn apply_write_response(
     dev: &Arc<Mutex<DeviceRuntime>>,
     area: Area,
@@ -522,10 +523,12 @@ async fn handle_write(
         let g = dev.lock().unwrap();
         (g.slave_id, g.point_info(point_id))
     };
-    let (area, addr, dt) = info.ok_or("点位不存在")?;
-    let pdu = build_write_pdu(area, addr, dt, value)?;
+    let (area, addr, dt, scale, offset) = info.ok_or("点位不存在")?;
+    // 输入工程值 → 逆变换为寄存器原始值下发（apply_write_response 回读口径一致）
+    let raw = crate::runtime::eng_to_raw(value, area, scale, offset);
+    let pdu = build_write_pdu(area, addr, dt, raw)?;
     let resp = d.transact(stream, ctx, unit, &pdu, timeout_ms).await?;
-    apply_write_response(dev, area, addr, dt, value, &resp)
+    apply_write_response(dev, area, addr, dt, raw, &resp)
 }
 
 // ---------- Modbus RTU 主机（串口轮询） ----------
@@ -832,8 +835,10 @@ fn handle_write_rtu(
         let g = dev.lock().unwrap();
         (g.slave_id, g.point_info(point_id))
     };
-    let (area, addr, dt) = info.ok_or("点位不存在")?;
-    let pdu = build_write_pdu(area, addr, dt, value)?;
+    let (area, addr, dt, scale, offset) = info.ok_or("点位不存在")?;
+    // 同 TCP 主机：工程值 → 原始值下发
+    let raw = crate::runtime::eng_to_raw(value, area, scale, offset);
+    let pdu = build_write_pdu(area, addr, dt, raw)?;
     let (resp, _) = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms, ATTEMPTS, false)?;
-    apply_write_response(dev, area, addr, dt, value, &resp)
+    apply_write_response(dev, area, addr, dt, raw, &resp)
 }
