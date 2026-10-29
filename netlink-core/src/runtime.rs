@@ -111,6 +111,10 @@ struct PointRuntime {
     data_type: DataType,
     scale: f64,
     offset: f64,
+    /// 是否参与主机轮询（只写寄存器为 false，见 model::Point::poll）
+    poll: bool,
+    /// 点位可写性三态（见 model::Point::writable）：None=按区默认
+    writable: Option<bool>,
     source: ValueSource,
 }
 
@@ -210,6 +214,8 @@ impl DeviceRuntime {
                 data_type: p.data_type,
                 scale: p.scale,
                 offset: p.offset,
+                poll: p.poll,
+                writable: p.writable,
                 source: p.source.clone(),
             })
             .collect();
@@ -459,20 +465,29 @@ impl DeviceRuntime {
         }
     }
 
-    /// 点位布局（主机轮询分段用）：(point_id, area, address, data_type)
+    /// 点位布局（主机轮询分段用）：(point_id, area, address, data_type)。
+    /// poll=false 的点不参与轮询（只写寄存器等场景），写命令走 point_info 不受影响。
     pub fn point_layout(&self) -> Vec<(u64, Area, u16, DataType)> {
         self.points
             .iter()
+            .filter(|p| p.poll)
             .map(|p| (p.id, p.area, p.address, p.data_type))
             .collect()
     }
 
-    /// 按点位 id 查布局与换算参数（写命令用：输入工程值 → 逆变换下发）
-    pub fn point_info(&self, point_id: u64) -> Option<(Area, u16, DataType, f64, f64)> {
+    /// 按点位 id 查布局与换算参数（写命令用：输入工程值 → 逆变换下发）。
+    /// 末位为有效可写性：writable 三态按区默认展开——FC03 遥测采集点
+    /// （holding + writable=false）在此处即被判定不可写。
+    pub fn point_info(&self, point_id: u64) -> Option<(Area, u16, DataType, f64, f64, bool)> {
         self.points
             .iter()
             .find(|p| p.id == point_id)
-            .map(|p| (p.area, p.address, p.data_type, p.scale, p.offset))
+            .map(|p| {
+                let writable = p
+                    .writable
+                    .unwrap_or(matches!(p.area, Area::Coil | Area::HoldingRegister));
+                (p.area, p.address, p.data_type, p.scale, p.offset, writable)
+            })
     }
 
     /// 本轮采集成功

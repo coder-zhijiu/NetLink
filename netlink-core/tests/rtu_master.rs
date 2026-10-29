@@ -111,6 +111,8 @@ fn slave_device() -> Device {
                 data_type: DataType::F32,
                 scale: 1.0,
                 offset: 0.0,
+                poll: true,
+                writable: None,
                 source: ValueSource::Static { value: 123.5 },
                 note: None,
             },
@@ -122,6 +124,8 @@ fn slave_device() -> Device {
                 data_type: DataType::F32,
                 scale: 1.0,
                 offset: 0.0,
+                poll: true,
+                writable: None,
                 source: ValueSource::Static { value: 456.25 },
                 note: None,
             },
@@ -133,6 +137,8 @@ fn slave_device() -> Device {
                 data_type: DataType::U16,
                 scale: 1.0,
                 offset: 0.0,
+                poll: true,
+                writable: None,
                 source: ValueSource::Static { value: 1.0 },
                 note: None,
             },
@@ -158,6 +164,8 @@ fn master_device() -> Device {
                 data_type: DataType::F32,
                 scale: 1.0,
                 offset: 0.0,
+                poll: true,
+                writable: None,
                 source: ValueSource::Static { value: 0.0 },
                 note: None,
             },
@@ -169,6 +177,8 @@ fn master_device() -> Device {
                 data_type: DataType::F32,
                 scale: 1.0,
                 offset: 0.0,
+                poll: true,
+                writable: None,
                 source: ValueSource::Static { value: 0.0 },
                 note: None,
             },
@@ -180,6 +190,22 @@ fn master_device() -> Device {
                 data_type: DataType::U16,
                 scale: 1.0,
                 offset: 0.0,
+                poll: true,
+                writable: None,
+                source: ValueSource::Static { value: 0.0 },
+                note: None,
+            },
+            // FC03 遥测采集点：住在保持寄存器（区可写）但 writable=false 拦截写命令
+            Point {
+                id: 24,
+                name: "FC03遥测".into(),
+                area: Area::HoldingRegister,
+                address: 10,
+                data_type: DataType::F32,
+                scale: 1.0,
+                offset: 0.0,
+                poll: true,
+                writable: Some(false),
                 source: ValueSource::Static { value: 0.0 },
                 note: None,
             },
@@ -266,6 +292,14 @@ async fn rtu_master_polls_writes_and_rejects_readonly() {
         .unwrap();
     let err = r_rx.await.unwrap().unwrap_err();
     assert!(err.contains("只读"), "错误应说明只读: {err}");
+
+    // ---- 4.5. 写 FC03 遥测采集点：住在保持寄存器（区可写）但 writable=false，应在下发前被拦截 ----
+    let (r_tx, r_rx) = tokio::sync::oneshot::channel();
+    tx.send(MasterMsg::Write { device: master_rt.clone(), point_id: 24, value: 1.0, reply: r_tx })
+        .await
+        .unwrap();
+    let err = r_rx.await.unwrap().unwrap_err();
+    assert!(err.contains("只读采集点"), "错误应说明只读采集点: {err}");
 
     // ---- 5. 测试帧：FC03 读 holding 0..2 → 999.0 的字 ----
     let (r_tx, r_rx) = tokio::sync::oneshot::channel();

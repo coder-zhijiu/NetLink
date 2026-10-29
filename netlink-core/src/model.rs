@@ -136,6 +136,13 @@ fn d_scale() -> f64 {
 fn d_offset() -> f64 {
     0.0
 }
+/// 轮询开关缺省：缺字段视为参与轮询（兼容旧工程）
+fn d_poll() -> bool {
+    true
+}
+fn is_true(v: &bool) -> bool {
+    *v
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Point {
@@ -150,6 +157,15 @@ pub struct Point {
     pub scale: f64,
     #[serde(default = "d_offset")]
     pub offset: f64,
+    /// 是否纳入主机轮询读。只写寄存器（外部设备回读静默）设 false，避免每周期白耗重试超时；
+    /// 手动写命令不受影响。缺省 true（true 不序列化，保持旧工程格式不变）。
+    #[serde(default = "d_poll", skip_serializing_if = "is_true")]
+    pub poll: bool,
+    /// 点位可写性（三态）：None=按区默认（线圈/保持寄存器可写、输入区只读，兼容旧工程）；
+    /// Some(false)=强制只读——FC03 遥测采集点等「住在可写区但语义为纯采集」的点位，
+    /// 防误写真实设备寄存器；Some(true)=强制可写。缺省 None 不序列化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable: Option<bool>,
     pub source: ValueSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -440,6 +456,8 @@ impl ProjectSpec {
                 data_type,
                 scale: 1.0,
                 offset: 0.0,
+                poll: true,
+                writable: None,
                 source,
                 note: None,
             }

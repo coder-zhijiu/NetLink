@@ -832,6 +832,10 @@ export function createMockApi(): NetLinkApi {
       if (pt.area === 'discrete_input' || pt.area === 'input_register') {
         throw new Error(`${pt.area === 'discrete_input' ? '离散输入' : '输入寄存器'}为只读区，仅线圈/保持寄存器可写`)
       }
+      // 与 Rust 端一致：只读采集点（writable=false）拦截，防误写
+      if (pt.writable === false) {
+        throw new Error('该点为只读采集点，已拦截写入（点位 writable=false）')
+      }
       // 线圈按 Modbus 语义归一化为 0/1（≥0.5 = 合）
       if (pt.area === 'coil') value = value >= 0.5 ? 1 : 0
       const patch: Record<number, number> = {}

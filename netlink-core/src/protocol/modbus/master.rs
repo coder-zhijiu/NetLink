@@ -523,10 +523,15 @@ async fn handle_write(
         let g = dev.lock().unwrap();
         (g.slave_id, g.point_info(point_id))
     };
-    let (area, addr, dt, scale, offset) = info.ok_or("点位不存在")?;
+    let (area, addr, dt, scale, offset, writable) = info.ok_or("点位不存在")?;
     // 输入工程值 → 逆变换为寄存器原始值下发（apply_write_response 回读口径一致）
     let raw = crate::runtime::eng_to_raw(value, area, scale, offset);
+    // 区检查在前（输入区协议只读，原文案）；采集点语义拦截在后：
+    // FC03 遥测点住在保持寄存器（区可写）但 writable=false，下发前拒绝，防误写真实设备
     let pdu = build_write_pdu(area, addr, dt, raw)?;
+    if !writable {
+        return Err("该点为只读采集点，已拦截写入（点位 writable=false）".to_string());
+    }
     let resp = d.transact(stream, ctx, unit, &pdu, timeout_ms).await?;
     apply_write_response(dev, area, addr, dt, raw, &resp)
 }
@@ -835,10 +840,13 @@ fn handle_write_rtu(
         let g = dev.lock().unwrap();
         (g.slave_id, g.point_info(point_id))
     };
-    let (area, addr, dt, scale, offset) = info.ok_or("点位不存在")?;
-    // 同 TCP 主机：工程值 → 原始值下发
+    let (area, addr, dt, scale, offset, writable) = info.ok_or("点位不存在")?;
+    // 同 TCP 主机：区检查在前，采集点语义拦截（writable=false）在后
     let raw = crate::runtime::eng_to_raw(value, area, scale, offset);
     let pdu = build_write_pdu(area, addr, dt, raw)?;
+    if !writable {
+        return Err("该点为只读采集点，已拦截写入（点位 writable=false）".to_string());
+    }
     let (resp, _) = rtu_transact_retry(io, ctx, unit, &pdu, timeout_ms, ATTEMPTS, false)?;
     apply_write_response(dev, area, addr, dt, raw, &resp)
 }

@@ -77,8 +77,10 @@ const editingPointId = ref<number | null>(null)
 const editingValue = ref(0)
 const writeError = ref('')
 
-/** Modbus 只允许写线圈与保持寄存器；输入区（离散输入/输入寄存器）协议只读 */
+/** Modbus 只允许写线圈与保持寄存器；输入区（离散输入/输入寄存器）协议只读。
+ *  writable=false 覆盖区默认：FC03 遥测采集点住在保持寄存器但为纯采集，不可写 */
 function pointWritable(p: Point): boolean {
+  if (p.writable === false) return false
   return p.area === 'coil' || p.area === 'holding_register'
 }
 
@@ -96,6 +98,7 @@ function valueCellTitle(p: Point): string {
   let base: string
   if (!isMaster.value) base = '仿真实时值（数据源产出工程值，寄存器自动按 (工程值−偏移量)÷系数 存原始值）'
   else if (!connRunning.value) base = '连接未启动，无实时值'
+  else if (p.writable === false) base = '只读采集点（writable=false）：纯采集值，写命令已拦截，防误写设备寄存器'
   else if (!pointWritable(p)) base = '只读区：Modbus 输入区（FC02/04）不可写，仅线圈/保持寄存器可写'
   else if (p.area === 'coil') base = '点击写值下发（线圈为 0/1 开关量：0=分，≥0.5 一律按合=1，FC05）'
   else base = '点击写值下发（自动选 FC06/FC10，输入工程值自动换算为原始值）'
@@ -147,6 +150,8 @@ interface EditState {
   /** 工程量换算：工程值 = 原始值 × 系数 + 偏移量（位区域禁用） */
   scale: number
   offset: number
+  /** 只读采集点（主机模式）：勾选 = writable:false 拦截写命令 */
+  writable: boolean
   sourceKind: SourceKind
   params: Required<Pick<ValueSource, 'value' | 'period_s' | 'amplitude' | 'offset' | 'step' | 'min' | 'max'>>
   note: string
@@ -162,6 +167,7 @@ const edit = reactive<EditState>({
   dataType: 'f32',
   scale: 1,
   offset: 0,
+  writable: false,
   sourceKind: 'sine',
   params: emptyParams(),
   note: '',
@@ -181,6 +187,7 @@ function openEditor(p: Point | null) {
     edit.dataType = p.data_type
     edit.scale = p.scale ?? 1
     edit.offset = p.offset ?? 0
+    edit.writable = p.writable === false
     edit.sourceKind = p.source.kind
     edit.params = { ...emptyParams(), ...p.source } as EditState['params']
     edit.note = p.note ?? ''
@@ -192,6 +199,7 @@ function openEditor(p: Point | null) {
     edit.dataType = 'f32'
     edit.scale = 1
     edit.offset = 0
+    edit.writable = false
     edit.sourceKind = 'sine'
     edit.params = emptyParams()
     edit.note = ''
@@ -243,6 +251,11 @@ async function saveEditor() {
     offset,
     source: applySource(),
     note: edit.note.trim() || undefined,
+  }
+  // 主机模式才管理可写性：勾选=只读采集点（false）；取消勾选=undefined 清除标志回区默认。
+  // 从机模式不传键，避免浅合并把已有只读标志抹掉（复选框也不显示）
+  if (isMaster.value) {
+    ;(base as Record<string, unknown>).writable = edit.writable ? false : undefined
   }
   if (edit.pointId != null) {
     patchPoint(dev.id, edit.pointId, base)
@@ -539,6 +552,13 @@ async function onExport() {
       <div v-if="!editIsBit" class="tip">
         工程值 = 原始值 × 系数 + 偏移量：主机采集按此显示工程值；从机寄存器自动存 (工程值 − 偏移量) ÷ 系数
       </div>
+      <label v-if="isMaster" class="f-row" title="勾选 = 该点视为纯采集值：即使住在保持寄存器（FC03 遥测回退场景），写命令也会在下发前拦截，防误写设备寄存器。不勾 = 按区默认（线圈/保持寄存器可写，输入区只读）">
+        <span class="f-lab">可写性</span>
+        <span class="f-chk">
+          <input v-model="edit.writable" type="checkbox" />
+          <span>只读采集点（拦截写命令）</span>
+        </span>
+      </label>
       <label v-if="!isMaster" class="f-row">
         <span class="f-lab">数据源</span>
         <select v-model="edit.sourceKind">

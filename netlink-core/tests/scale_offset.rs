@@ -20,6 +20,8 @@ fn point(id: u64, name: &str, area: Area, addr: u16, dt: DataType, scale: f64, o
         data_type: dt,
         scale,
         offset,
+        poll: true,
+        writable: None,
         source: ValueSource::Static { value },
         note: None,
     }

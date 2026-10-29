@@ -26,6 +26,8 @@ fn device_with(fault: FaultConfig) -> Device {
             data_type: DataType::F32,
             scale: 1.0,
             offset: 0.0,
+            poll: true,
+            writable: None,
             source: ValueSource::Static { value: 250.0 },
             note: None,
         }],

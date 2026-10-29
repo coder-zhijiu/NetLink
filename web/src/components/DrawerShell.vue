@@ -97,6 +97,19 @@ const emit = defineEmits<{ close: [] }>()
   width: 44px;
 }
 
+/* 复选框行内组合：覆盖 .f-row input 的 flex:1 拉伸 */
+.f-chk {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+}
+
+.f-chk input[type='checkbox'] {
+  flex: none;
+  width: auto;
+}
+
 .f-row input,
 .f-row select {
   flex: 1;

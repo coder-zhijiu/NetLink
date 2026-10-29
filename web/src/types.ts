@@ -57,6 +57,11 @@ export interface Point {
   scale?: number
   /** 工程量换算偏移量（默认 0；位区域不适用）。区别于正弦源 source.offset（波形基线） */
   offset?: number
+  /** 是否纳入主机轮询读（默认 true）。只写寄存器（外部设备回读静默）设 false，避免每周期白耗重试超时；手动写不受影响 */
+  poll?: boolean
+  /** 点位可写性三态（默认 undefined=按区默认：线圈/保持寄存器可写、输入区只读）。
+   *  false=强制只读采集点（FC03 遥测等「住在可写区但语义为纯采集」），写命令下发前拦截 */
+  writable?: boolean
   source: ValueSource
   note?: string
 }
