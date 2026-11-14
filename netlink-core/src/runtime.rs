@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use serde::Serialize;
 
 use crate::model::{Area, Connection, DataType, Device, FaultConfig, ProjectSpec, Transport, ValueSource};
-use crate::protocol::FrameEvent;
+use crate::protocol::{dlt645, FrameEvent};
 use crate::protocol::can::{CanAgg, CanAggSnapshot, CanMsg, CanNodeRuntime};
 use crate::protocol::modbus::master::{self, MasterMsg};
 use crate::protocol::modbus::scan::{ScanParams, ScanProgress, ScanResult};
@@ -579,6 +579,8 @@ struct ConnState {
     cmd_tx: Option<mpsc::Sender<MasterMsg>>,
     /// CAN 连接的命令通道（手动发送）；非 CAN 连接为 None
     can_cmd_tx: Option<mpsc::Sender<CanMsg>>,
+    dlt645_cmd_tx: Option<mpsc::Sender<dlt645::Command>>,
+    dlt645_meters: dlt645::Meters,
     /// CAN 连接的观测聚合（接收统计/帧率）；非 CAN 连接为 None
     can_agg: Option<Arc<Mutex<CanAgg>>>,
 }
@@ -593,6 +595,8 @@ pub enum ConnStateKind {
     Connected,
     /// 断开后重连中（含退避等待）
     Reconnecting,
+    /// 串口 I/O 失败，需要手动重启连接。
+    Disconnected,
 }
 
 /// 一条主机连接的当前链路状态
@@ -693,6 +697,7 @@ impl RuntimeManager {
         conn: &Connection,
         enabled_devices: Option<Vec<u64>>,
     ) -> Result<(), String> {
+        dlt645::validate(conn)?;
         let was_running = self.stop_connection(conn.id);
         // 旧实例的监听 socket / 串口句柄释放是异步的，重启前留一点余量
         if was_running {
@@ -754,6 +759,9 @@ impl RuntimeManager {
         }
         let mut cmd_tx: Option<mpsc::Sender<MasterMsg>> = None;
         let mut can_cmd_tx: Option<mpsc::Sender<CanMsg>> = None;
+        let mut dlt645_cmd_tx = None;
+        let dlt645_meters = Arc::new(Mutex::new(conn.dlt645_meters.iter().cloned()
+            .map(|meter| dlt645::MeterState::new(meter, enabled_devices.as_deref())).collect()));
         let mut can_agg: Option<Arc<Mutex<CanAgg>>> = None;
 
         // CAN 连接帧定义预校验（启动即暴露配置错误，而不是等到发送时静默失败）
@@ -825,6 +833,23 @@ impl RuntimeManager {
                 let t = master::serve_serial(Arc::new(ctx), port, *timeout_ms, cancel.clone(), rx);
                 tasks.push(tokio::spawn(t));
             }
+            Transport::Dlt645Serial { timeout_ms, .. } | Transport::Dlt645Tcp { timeout_ms, .. } => {
+                let worker = dlt645::Worker {
+                    conn_id: conn.id, meters: dlt645_meters.clone(), manager: self.clone(),
+                    cancel: cancel.clone(), timeout: Duration::from_millis((*timeout_ms).into()),
+                };
+                let (tx, rx) = mpsc::channel(16);
+                let task = match &conn.transport {
+                    Transport::Dlt645Serial { serial_port, baud, parity, stop_bits, .. } => {
+                        let port = crate::protocol::modbus::rtu::open_port(serial_port, *baud, *parity, *stop_bits)?;
+                        dlt645::serve_serial(worker, port, rx)
+                    }
+                    Transport::Dlt645Tcp { host, port, .. } => dlt645::serve_tcp(worker, host.clone(), *port, rx),
+                    _ => unreachable!(),
+                };
+                dlt645_cmd_tx = Some(tx);
+                tasks.push(task);
+            }
             Transport::UsbCan { backend, device_index: _, channel: _, bitrate, serial_port, serial_baud } => {
                 if backend != "slcan" {
                     return Err(format!(
@@ -883,6 +908,8 @@ impl RuntimeManager {
                 cmd_tx,
                 can_cmd_tx,
                 can_agg,
+                dlt645_cmd_tx,
+                dlt645_meters,
             },
         );
         Ok(())
@@ -890,10 +917,10 @@ impl RuntimeManager {
 
     /// 停止单条连接；返回该连接此前是否在运行
     pub fn stop_connection(&self, id: u64) -> bool {
-        self.inner.conn_states.lock().unwrap().remove(&id);
         self.inner.scans.lock().unwrap().remove(&id);
         if let Some(state) = self.inner.conns.lock().unwrap().remove(&id) {
             state.cancel.cancel();
+            self.inner.conn_states.lock().unwrap().remove(&id);
             for t in state.tasks {
                 t.abort();
             }
@@ -927,6 +954,8 @@ impl RuntimeManager {
                     out.push(d.id);
                 }
             }
+            out.extend(state.dlt645_meters.lock().unwrap().iter()
+                .filter(|m| m.polling()).map(|m| m.spec.id));
             for node in &state.can_nodes {
                 let n = node.lock().unwrap();
                 if n.enabled {
@@ -950,6 +979,10 @@ impl RuntimeManager {
                     return Ok(());
                 }
             }
+            if let Some(meter) = state.dlt645_meters.lock().unwrap().iter_mut().find(|m| m.spec.id == device_id) {
+                meter.set_polling(enabled);
+                return Ok(());
+            }
             for node in &state.can_nodes {
                 let mut n = node.lock().unwrap();
                 if n.id == device_id {
@@ -959,6 +992,50 @@ impl RuntimeManager {
             }
         }
         Err("设备不在任何运行中的连接里".to_string())
+    }
+
+    pub(crate) fn set_dlt645_conn_state(
+        &self, conn_id: u64, cancel: &CancellationToken, kind: ConnStateKind, detail: Option<String>,
+    ) {
+        let mut states = self.inner.conn_states.lock().unwrap();
+        if !cancel.is_cancelled() {
+            states.insert(conn_id, ConnStatus { kind, detail });
+        }
+    }
+
+    fn dlt645_sender(&self, conn_id: u64) -> Result<mpsc::Sender<dlt645::Command>, String> {
+        let conns = self.inner.conns.lock().unwrap();
+        let tx = conns.get(&conn_id).and_then(|conn| conn.dlt645_cmd_tx.clone())
+            .ok_or_else(|| "645 连接未启动".to_string())?;
+        let states = self.inner.conn_states.lock().unwrap();
+        match states.get(&conn_id) {
+            Some(state) if state.kind == ConnStateKind::Connected => Ok(tx),
+            Some(state) => Err(state.detail.clone().unwrap_or_else(|| "645 连接尚未建立".into())),
+            None => Err("645 连接尚未建立".into()),
+        }
+    }
+
+    pub async fn read_dlt645_address(&self, conn_id: u64) -> Result<String, String> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.dlt645_sender(conn_id)?.try_send(dlt645::Command::Address(reply)).map_err(dlt645_send_error)?;
+        result.await.map_err(|_| "645 连接已停止".to_string())?
+    }
+
+    pub async fn read_dlt645_point(&self, conn_id: u64, meter_id: u64, point_id: u64) -> Result<(), String> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.dlt645_sender(conn_id)?.try_send(dlt645::Command::Read { meter_id, point_id, reply })
+            .map_err(dlt645_send_error)?;
+        result.await.map_err(|_| "645 连接已停止".to_string())?
+    }
+
+    pub fn snapshot_dlt645(&self, meter_id: u64) -> HashMap<u64, dlt645::Sample> {
+        let conns = self.inner.conns.lock().unwrap();
+        for conn in conns.values() {
+            if let Some(meter) = conn.dlt645_meters.lock().unwrap().iter().find(|m| m.spec.id == meter_id) {
+                return meter.samples();
+            }
+        }
+        HashMap::new()
     }
 
     /// 选中设备的实时值（前端 250ms 拉取）
@@ -1155,5 +1232,12 @@ impl RuntimeManager {
 impl Default for RuntimeManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn dlt645_send_error(error: mpsc::error::TrySendError<dlt645::Command>) -> String {
+    match error {
+        mpsc::error::TrySendError::Full(_) => "645 请求队列已满".into(),
+        mpsc::error::TrySendError::Closed(_) => "645 连接已停止".into(),
     }
 }

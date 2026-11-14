@@ -1,6 +1,6 @@
 # NetLink 多协议工业模拟器
 
-[![version](https://img.shields.io/badge/version-1.0.0-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-1.2.0-blue)](../../releases)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)](#下载与安装)
 [![stack](https://img.shields.io/badge/Tauri%202%20·%20Rust%20·%20Vue%203-orange)](#技术栈)
 
@@ -13,6 +13,7 @@ NetLink 是一款面向电力/工业现场调试的**多协议主/从机模拟�
 ## 功能特性
 
 ### 协议模拟
+- **DL/T 645-2007 只读主站**：支持 RS-485 直连和 TCP 透传、单表读址、多表轮询、常用指标勾选与自定义 DI。周期采集自动合并标准数据块，失败时回退单点读取。
 - **Modbus TCP 从机**（网口监听）与 **Modbus RTU 从机**（真实串口 485）
 - **Modbus TCP / RTU 主机**：主动连接/轮询远端从机，采集健康统计（最近成功/超时/失败计数 + 最近失败原因悬浮提示）；主机连接断开自动退避重连，设备树显示「连接中/重连中」徽章与断开原因
 - 功能码 01/02/03/04/05/06/0F/10，四区（线圈/离散输入/保持寄存器/输入寄存器）全支持
@@ -51,11 +52,11 @@ NetLink 是一款面向电力/工业现场调试的**多协议主/从机模拟�
 
 ## 下载与安装
 
-从 [Releases](https://github.com/coder-zhijiu/NetLink/releases/latest) 下载 v1.1.0：
+从 [Releases](https://github.com/coder-zhijiu/NetLink/releases/latest) 下载 v1.2.0：
 
 | 文件 | 说明 |
 |---|---|
-| `NetLink_1.1.0_x64-setup.exe` | **NSIS 安装程序**（约 3.5 MB）——双击安装，含 WebView2 运行时引导、开始菜单/桌面快捷方式、卸载器；默认安装到当前用户目录，无需管理员权限 |
+| `NetLink_1.2.0_x64-setup.exe` | **NSIS 安装程序**——双击安装，含 WebView2 运行时引导、开始菜单/桌面快捷方式、卸载器；默认安装到当前用户目录，无需管理员权限 |
 | `netlink-app.exe` | **绿色单文件**（约 13 MB）——前端已内置，系统装有 WebView2 即可直接运行；工程目录自动建在 exe 旁 |
 
 系统要求：Windows 10 及以上（依赖 WebView2：Win11 自带；Win10 上安装包会自动引导安装）。

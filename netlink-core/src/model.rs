@@ -308,6 +308,14 @@ fn default_listen_addr() -> String {
 fn default_baud() -> u32 {
     9600
 }
+fn default_645_baud() -> u32 {
+    2400
+}
+
+fn default_645_parity() -> Parity {
+    Parity::Even
+}
+
 fn default_stop_bits() -> u8 {
     1
 }
@@ -370,6 +378,23 @@ pub enum Transport {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u32,
     },
+    Dlt645Serial {
+        serial_port: String,
+        #[serde(default = "default_645_baud")]
+        baud: u32,
+        #[serde(default = "default_645_parity")]
+        parity: Parity,
+        #[serde(default = "default_stop_bits")]
+        stop_bits: u8,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u32,
+    },
+    Dlt645Tcp {
+        host: String,
+        port: u16,
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u32,
+    },
     /// CAN 直采直控：USB-CAN 适配器直连总线（被动监听全量报文 + 手动/周期发送）
     UsbCan {
         /// "slcan"（v1 已实现）；"zlgcan" / "candle" 待硬件到货启用
@@ -413,6 +438,48 @@ pub struct Connection {
     /// CAN 连接下的节点（替代「设备」层；Modbus 连接恒为空）
     #[serde(default)]
     pub can_nodes: Vec<CanNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dlt645_meters: Vec<Dlt645Meter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dlt645Meter {
+    pub id: u64,
+    pub name: String,
+    pub address: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub poll: bool,
+    #[serde(default = "default_poll_period")]
+    pub poll_period_ms: u32,
+    #[serde(default)]
+    pub points: Vec<Dlt645Point>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dlt645Format {
+    Bcd,
+    SignedBcd,
+    Unsigned,
+    Signed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dlt645Point {
+    pub id: u64,
+    pub name: String,
+    pub di: String,
+    pub format: Dlt645Format,
+    pub bytes: u8,
+    pub decimals: u8,
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default = "d_scale")]
+    pub scale: f64,
+    #[serde(default = "d_poll")]
+    pub poll: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +611,7 @@ impl ProjectSpec {
                         port: 502,
                     },
                     devices: vec![dev1, dev2],
+                    dlt645_meters: vec![],
                     can_nodes: vec![],
                 },
                 Connection {
@@ -556,6 +624,7 @@ impl ProjectSpec {
                         stop_bits: 1,
                     },
                     devices: vec![dev3],
+                    dlt645_meters: vec![],
                     can_nodes: vec![],
                 },
                 // 主机连接：连本工具自己模拟的从机（127.0.0.1:502），
@@ -582,6 +651,7 @@ impl ProjectSpec {
                             pt(&mut id, "有功设定", Area::HoldingRegister, 0, DataType::F32, ValueSource::Static { value: 0.0 }),
                         ],
                     }],
+                    dlt645_meters: vec![],
                     can_nodes: vec![],
                 },
                 // CAN 直采直控示例：slcan 后端（CANable 等）；串口名按实际适配器修改后启动
@@ -597,6 +667,7 @@ impl ProjectSpec {
                         serial_baud: default_serial_baud(),
                     },
                     devices: vec![],
+                    dlt645_meters: vec![],
                     can_nodes: vec![
                         CanNode {
                             id: 401,

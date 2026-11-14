@@ -40,6 +40,7 @@ fn slave_project(port: u16) -> ProjectSpec {
                 listen_addr: "127.0.0.1".into(),
                 port,
             },
+            dlt645_meters: vec![],
             can_nodes: vec![],
             devices: vec![Device {
                 id: 901,
@@ -120,6 +121,7 @@ fn master_project(port: u16) -> ProjectSpec {
                 port,
                 timeout_ms: 400,
             },
+            dlt645_meters: vec![],
             can_nodes: vec![],
             devices: vec![Device {
                 id: 902,

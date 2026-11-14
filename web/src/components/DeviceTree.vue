@@ -21,14 +21,16 @@ import {
   connOfId,
   restartConnIfRunning,
   runningDevicesOfConn,
+  selectProjectObject,
 } from '../store'
-import type { Connection, Device, Transport, TransportKind, FaultKind, Parity, TestConnResult, CanNode } from '../types'
+import type { Connection, Device, Transport, TransportKind, FaultKind, Parity, TestConnResult, CanNode, Dlt645Meter } from '../types'
 import {
   FAULT_LABELS,
   TRANSPORT_LABELS,
   CAN_BACKEND_LABELS,
   CAN_BITRATES,
   isCanTransport,
+  isDlt645Transport,
   isFaultKindAllowedForTransport,
   isMasterTransport,
 } from '../types'
@@ -39,7 +41,7 @@ import { openTestPanel, openCanPanel } from '../store'
 const project = computed(() => store.project)
 
 const allDevCount = computed(() =>
-  (store.project?.connections ?? []).reduce((n, c) => n + c.devices.length + (c.can_nodes?.length ?? 0), 0),
+  (store.project?.connections ?? []).reduce((n, c) => n + c.devices.length + (c.can_nodes?.length ?? 0) + (c.dlt645_meters?.length ?? 0), 0),
 )
 
 function isMasterConn(conn: Connection): boolean {
@@ -52,7 +54,7 @@ function isCanConn(conn: Connection): boolean {
 
 function transportSummary(t: Transport): string {
   if (t.kind === 'tcp_server') return `TCP :${t.port ?? 502}`
-  if (t.kind === 'tcp_client') return `→ ${t.host ?? '?'}:${t.port ?? 502}`
+  if (t.kind === 'tcp_client' || t.kind === 'dlt645_tcp') return `→ ${t.host ?? '?'}:${t.port ?? 502}`
   if (t.kind === 'usb_can') {
     return t.backend === 'slcan'
       ? `${t.serial_port ?? 'COM?'} · CAN@${fmtBitrate(t.bitrate ?? 500000)}`
@@ -89,7 +91,7 @@ function connTooltip(conn: Connection): string {
       )
     }
   }
-  if (isMasterConn(conn) || isCanConn(conn)) {
+  if (isMasterConn(conn) || isCanConn(conn) || isDlt645Transport(conn.transport.kind)) {
     const st = store.connStates[conn.id]
     if (st) {
       const label = CONN_STATE_LABELS[st.kind]
@@ -104,11 +106,12 @@ const CONN_STATE_LABELS: Record<string, string> = {
   connecting: '连接中',
   connected: '已连接',
   reconnecting: '重连中',
+  disconnected: '已断开',
 }
 
 /** 主机连接链路异常徽章（连接中/重连中才显示；已连接不占行内空间） */
 function connStateBadge(conn: Connection): { label: string; title: string } | null {
-  if ((!isMasterConn(conn) && !isCanConn(conn)) || !connRunning(conn.id)) return null
+  if ((!isMasterConn(conn) && !isCanConn(conn) && !isDlt645Transport(conn.transport.kind)) || !connRunning(conn.id)) return null
   const st = store.connStates[conn.id]
   if (!st || st.kind === 'connected') return null
   const label = CONN_STATE_LABELS[st.kind] ?? st.kind
@@ -133,8 +136,7 @@ function nodeDotClass(node: CanNode): Record<string, boolean> {
 }
 
 function selectDevice(id: number) {
-  store.selectedDeviceId = id
-  api.selectDevice(id)
+  selectProjectObject(id)
 }
 
 /** 设备行悬浮提示：名称 + 从机地址 + 点数（ID 徽章移入提示） */
@@ -262,6 +264,8 @@ function connMenu(e: MouseEvent, conn: Connection) {
   if (isCanConn(conn)) {
     items.push({ label: '＋ 新建 CAN 节点', action: () => openNodeEditor(conn.id, null) })
     items.push({ label: '发送 CAN 帧', action: () => openCanPanel(conn.id) })
+  } else if (isDlt645Transport(conn.transport.kind)) {
+    items.push({ label: '＋ 添加电表', action: () => openMeterEditor(conn.id, null) })
   } else {
     items.push({ label: '＋ 新建设备', action: () => openDevEditor(conn.id, null) })
   }
@@ -365,6 +369,11 @@ const serialPorts = ref<string[]>([])
 watch(
   () => connEdit.kind,
   (kind, old) => {
+    if (kind === 'dlt645_serial' && connEdit.id == null) {
+      connEdit.baud = 2400
+      connEdit.parity = 'even'
+      connEdit.stopBits = 1
+    }
     if (kind === 'can_net' && old !== 'can_net' && [502, 5020].includes(connEdit.port)) {
       connEdit.port = 4001
     }
@@ -379,7 +388,7 @@ const connTest = reactive<{ busy: boolean; result: TestConnResult | null }>({
 
 /** 检测按钮语义随传输方式变化：TCP 主机=测试连接；从机=检查端口；串口=检查串口占用 */
 const connTestLabel = computed(() => {
-  if (connEdit.kind === 'tcp_client' || connEdit.kind === 'can_net') return '测试连接'
+  if ((connEdit.kind === 'tcp_client' || connEdit.kind === 'dlt645_tcp') || connEdit.kind === 'can_net') return '测试连接'
   if (connEdit.kind === 'tcp_server') return '检查端口'
   if (connEdit.kind === 'usb_can' && connEdit.canBackend !== 'slcan') return '检测后端'
   return '检查串口'
@@ -405,7 +414,7 @@ function openConnEditor(c: Connection | null) {
     if (c.transport.kind === 'tcp_server') {
       connEdit.listenAddr = c.transport.listen_addr ?? '0.0.0.0'
       connEdit.port = c.transport.port ?? 502
-    } else if (c.transport.kind === 'tcp_client') {
+    } else if ((c.transport.kind === 'tcp_client' || c.transport.kind === 'dlt645_tcp')) {
       connEdit.host = c.transport.host ?? '127.0.0.1'
       connEdit.port = c.transport.port ?? 502
       connEdit.timeoutMs = c.transport.timeout_ms ?? 1000
@@ -425,10 +434,10 @@ function openConnEditor(c: Connection | null) {
     } else {
       // serial / serial_master 共用串口字段；serial_master 另有超时
       connEdit.serialPort = c.transport.serial_port ?? 'COM3'
-      connEdit.baud = c.transport.baud ?? 9600
-      connEdit.parity = c.transport.parity ?? 'none'
+      connEdit.baud = c.transport.baud ?? (c.transport.kind === 'dlt645_serial' ? 2400 : 9600)
+      connEdit.parity = c.transport.parity ?? (c.transport.kind === 'dlt645_serial' ? 'even' : 'none')
       connEdit.stopBits = c.transport.stop_bits ?? 1
-      if (c.transport.kind === 'serial_master') {
+      if ((c.transport.kind === 'serial_master' || c.transport.kind === 'dlt645_serial')) {
         connEdit.timeoutMs = c.transport.timeout_ms ?? 1000
       }
     }
@@ -471,12 +480,12 @@ function applyTransport(): Transport {
       port: Math.max(1, Math.min(65535, Math.round(connEdit.port) || 502)),
     }
   }
-  if (connEdit.kind === 'tcp_client') {
+  if ((connEdit.kind === 'tcp_client' || connEdit.kind === 'dlt645_tcp')) {
     return {
-      kind: 'tcp_client',
+      kind: connEdit.kind,
       host: connEdit.host.trim() || '127.0.0.1',
       port: Math.max(1, Math.min(65535, Math.round(connEdit.port) || 502)),
-      timeout_ms: Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
+      timeout_ms: isDlt645Transport(connEdit.kind) ? Math.min(60000, Math.max(50, Math.round(connEdit.timeoutMs) || 1000)) : Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
     }
   }
   if (connEdit.kind === 'usb_can') {
@@ -497,17 +506,17 @@ function applyTransport(): Transport {
       host: connEdit.host.trim() || '127.0.0.1',
       port: Math.max(1, Math.min(65535, Math.round(connEdit.port) || 502)),
       channel: Math.min(1, Math.max(0, Math.round(connEdit.canChannel) || 0)),
-      timeout_ms: Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
+      timeout_ms: isDlt645Transport(connEdit.kind) ? Math.min(60000, Math.max(50, Math.round(connEdit.timeoutMs) || 1000)) : Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
     }
   }
-  if (connEdit.kind === 'serial_master') {
+  if ((connEdit.kind === 'serial_master' || connEdit.kind === 'dlt645_serial')) {
     return {
-      kind: 'serial_master',
+      kind: connEdit.kind,
       serial_port: connEdit.serialPort.trim() || 'COM3',
       baud: connEdit.baud,
       parity: connEdit.parity,
       stop_bits: connEdit.stopBits,
-      timeout_ms: Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
+      timeout_ms: isDlt645Transport(connEdit.kind) ? Math.min(60000, Math.max(50, Math.round(connEdit.timeoutMs) || 1000)) : Math.max(50, Math.round(connEdit.timeoutMs) || 1000),
     }
   }
   return {
@@ -524,6 +533,12 @@ async function saveConnEditor() {
   const base = { name: connEdit.name.trim() || '未命名连接', transport: applyTransport() }
   const editId = connEdit.id
   if (editId != null) {
+    const existing = project.value?.connections.find((c) => c.id === editId)
+    if (existing && isDlt645Transport(existing.transport.kind) !== isDlt645Transport(base.transport.kind)
+      && (existing.devices.length || existing.can_nodes?.length || existing.dlt645_meters?.length)) {
+      await uiAlert('连接中已有设备，请新建另一种协议的连接。')
+      return
+    }
     patchConnection(editId, base)
   } else {
     addConnection({ id: nextConnId(), devices: [], can_nodes: [], ...base })
@@ -534,7 +549,7 @@ async function saveConnEditor() {
 }
 
 async function delConn(conn: Connection) {
-  const n = conn.devices.length
+  const n = conn.devices.length + (conn.dlt645_meters?.length ?? 0)
   const msg = n > 0 ? `删除连接「${conn.name}」及其 ${n} 台设备？` : `删除连接「${conn.name}」？`
   if (!(await uiConfirm(msg, '删除连接'))) return
   // 先停后删，避免删除后端口/串口仍被旧实例占用
@@ -656,6 +671,84 @@ async function delDev(dev: Device) {
 
 // ---------- CAN 节点编辑 ----------
 
+const meterEdit = reactive({ connId: 0, id: null as number | null, name: '', address: '', poll_period_ms: 1000 })
+const meterEditorOpen = ref(false)
+const meterBusy = ref(false)
+const meterError = ref('')
+const meterConnected = computed(() =>
+  connRunning(meterEdit.connId) && store.connStates[meterEdit.connId]?.kind === 'connected',
+)
+
+function openMeterEditor(connId: number, meter: Dlt645Meter | null) {
+  if (meterBusy.value) return
+  Object.assign(meterEdit, {
+    connId, id: meter?.id ?? null, name: meter?.name ?? '新电表',
+    address: meter?.address ?? '', poll_period_ms: meter?.poll_period_ms ?? 1000,
+  })
+  meterError.value = ''
+  meterEditorOpen.value = true
+}
+
+async function readMeterAddress() {
+  if (meterBusy.value) return
+  meterBusy.value = true
+  meterError.value = ''
+  try {
+    meterEdit.address = await api.readDlt645Address(meterEdit.connId)
+  } catch (error) {
+    meterError.value = String(error)
+  } finally {
+    meterBusy.value = false
+  }
+}
+
+async function saveMeterEditor() {
+  const conn = project.value?.connections.find((c) => c.id === meterEdit.connId)
+  if (!conn || meterBusy.value) return
+  const address = meterEdit.address.trim()
+  if (!/^\d{12}$/.test(address) || address === '999999999999') {
+    meterError.value = '请输入 12 位表地址，保留前导零。'
+    return
+  }
+  if (conn.dlt645_meters?.some((m) => m.id !== meterEdit.id && m.address === address)) {
+    meterError.value = '该连接已配置此表地址。'
+    return
+  }
+  const period = meterEdit.poll_period_ms
+  if (!meterEdit.name.trim() || !Number.isInteger(period) || period < 1 || period > 0xffffffff) {
+    meterError.value = '请填写名称和有效的轮询周期。'
+    return
+  }
+  conn.dlt645_meters ??= []
+  const existing = conn.dlt645_meters.find((m) => m.id === meterEdit.id)
+  const values = { name: meterEdit.name.trim(), address, poll_period_ms: period }
+  let id = existing?.id
+  const online = runningDevicesOfConn(conn.id)
+  if (existing) Object.assign(existing, values)
+  else {
+    id = nextDevId()
+    conn.dlt645_meters.push({ id, ...values, enabled: true, poll: true, points: [] })
+    online.push(id)
+  }
+  meterEditorOpen.value = false
+  selectProjectObject(id ?? null)
+  await restartConnIfRunning(conn.id, online)
+}
+
+async function deleteMeter(conn: Connection, meter: Dlt645Meter) {
+  if (!await uiConfirm(`删除电表「${meter.name}」及其点表？`)) return
+  conn.dlt645_meters = conn.dlt645_meters?.filter((m) => m.id !== meter.id)
+  if (store.selectedDeviceId === meter.id) selectProjectObject(conn.dlt645_meters?.[0]?.id ?? null)
+  await restartConnIfRunning(conn.id)
+}
+
+function meterMenu(e: MouseEvent, conn: Connection, meter: Dlt645Meter) {
+  openMenu(e, meter.name, [
+    { label: '编辑电表', action: () => openMeterEditor(conn.id, meter) },
+    { label: '删除电表', action: () => deleteMeter(conn, meter), danger: true },
+  ])
+}
+
 const nodeEdit = reactive<{ connId: number | null; id: number | null; name: string; enabled: boolean }>({
   connId: null,
   id: null,
@@ -734,7 +827,7 @@ const parityOptions: Array<{ label: string; value: Parity }> = [
   { label: '偶校验', value: 'even' },
   { label: '奇校验', value: 'odd' },
 ]
-const baudOptions = [1200, 2400, 4800, 9600, 19200, 38400, 115200]
+const baudOptions = [600, 1200, 2400, 4800, 9600, 19200, 38400, 115200]
 /** slcan 串口侧波特率（与 CAN 波特率独立；适配器固件常为 115200） */
 const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 </script>
@@ -823,7 +916,27 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
             </button>
           </div>
 
-          <div v-if="conn.devices.length === 0 && (conn.can_nodes ?? []).length === 0" class="dev-empty" @contextmenu="connMenu($event, conn)">
+          <div
+            v-for="meter in conn.dlt645_meters ?? []"
+            :key="meter.id"
+            class="node dev-node"
+            :class="{ selected: meter.id === store.selectedDeviceId }"
+            :title="`表地址 ${meter.address}`"
+            @click="selectProjectObject(meter.id)"
+            @contextmenu="meterMenu($event, conn, meter)"
+          >
+            <span class="dot" :class="{ on: deviceRunning(meter.id) }" />
+            <span class="label">{{ meter.name }}</span>
+            <span class="count">{{ meter.points.length }} 点</span>
+            <button class="node-btn" :class="{ on: deviceRunning(meter.id) }" :disabled="switching"
+              :title="deviceRunning(meter.id) ? '暂停轮询，保留连接' : '启动轮询'"
+              @click.stop="toggleDev(meter.id, meter.name)">{{ deviceRunning(meter.id) ? '■' : '▶' }}</button>
+          </div>
+
+          <div v-if="isDlt645Transport(conn.transport.kind)" class="dev-empty" @contextmenu="connMenu($event, conn)">
+            <button class="mini" @click="openMeterEditor(conn.id, null)">＋ 添加电表</button>
+          </div>
+          <div v-else-if="conn.devices.length === 0 && (conn.can_nodes ?? []).length === 0" class="dev-empty" @contextmenu="connMenu($event, conn)">
             <span>{{ isCanConn(conn) ? '无 CAN 节点（右键新建）' : '无设备（右键新建）' }}</span>
           </div>
         </div>
@@ -854,6 +967,26 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
       </div>
     </Teleport>
 
+    <DrawerShell v-if="meterEditorOpen" :title="meterEdit.id == null ? '添加电表' : '编辑电表'"
+      @close="!meterBusy && (meterEditorOpen = false)">
+      <label class="f-row"><span class="f-lab">名称</span><input v-model="meterEdit.name" /></label>
+      <label class="f-row"><span class="f-lab">表地址</span>
+        <input v-model="meterEdit.address" inputmode="numeric" maxlength="12" class="mono" placeholder="12 位数字" />
+      </label>
+      <button :disabled="!meterConnected || meterBusy" @click="readMeterAddress">
+        {{ meterBusy ? '读取中…' : '读取表地址' }}
+      </button>
+      <p class="tip">读取表地址前，请启动连接，并确保当前链路只接一块电表。</p>
+      <label class="f-row"><span class="f-lab">轮询周期 (ms)</span>
+        <input v-model.number="meterEdit.poll_period_ms" type="number" min="1" />
+      </label>
+      <p v-if="meterError" role="alert" class="test-result bad">{{ meterError }}</p>
+      <template #footer>
+        <button :disabled="meterBusy" @click="meterEditorOpen = false">取消</button>
+        <button class="primary" :disabled="meterBusy" @click="saveMeterEditor">保存</button>
+      </template>
+    </DrawerShell>
+
     <!-- 连接编辑抽屉 -->
     <DrawerShell v-if="connEditorOpen" :title="connEdit.id != null ? '编辑连接' : '新建连接'" @close="connEditorOpen = false">
       <label class="f-row">
@@ -869,6 +1002,8 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
           <option value="serial_master">{{ TRANSPORT_LABELS['serial_master'] }}</option>
           <option value="usb_can">{{ TRANSPORT_LABELS['usb_can'] }}</option>
           <option value="can_net">{{ TRANSPORT_LABELS['can_net'] }}</option>
+          <option value="dlt645_serial">{{ TRANSPORT_LABELS.dlt645_serial }}</option>
+          <option value="dlt645_tcp">{{ TRANSPORT_LABELS.dlt645_tcp }}</option>
         </select>
       </label>
 
@@ -885,7 +1020,7 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
         <p class="tip">模拟从机将在该端口监听，上位机（主站）连接此地址轮询。保存前可点「检查端口」确认未被占用。</p>
       </div>
 
-      <div v-else-if="connEdit.kind === 'tcp_client'" class="f-group">
+      <div v-else-if="(connEdit.kind === 'tcp_client' || connEdit.kind === 'dlt645_tcp')" class="f-group">
         <div class="f-row">
           <span class="f-lab">远端地址</span>
           <input v-model="connEdit.host" placeholder="127.0.0.1" class="mono" />
@@ -895,9 +1030,10 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
         <div class="f-row">
           <span class="f-lab">超时(ms)</span>
           <input v-model.number="connEdit.timeoutMs" type="number" min="50" step="50" class="mono" />
-          <span class="tip-inline">请求超时+重试2次；断线自动重连</span>
+          <span class="tip-inline">{{ connEdit.kind === 'dlt645_tcp' ? '断线自动重连' : '请求超时+重试2次；断线自动重连' }}</span>
         </div>
-        <p class="tip">主机连接：主动连接远端从机并按设备点表轮询采集。保存前可「测试连接」验证远端可达。</p>
+        <p v-if="connEdit.kind === 'dlt645_tcp'" class="tip">填写网关的 TCP 透明传输端口。电表侧波特率、校验和停止位在网关上配置。</p>
+        <p v-else class="tip">主机连接：主动连接远端从机并按设备点表轮询采集。保存前可「测试连接」验证远端可达。</p>
       </div>
 
       <div v-else-if="connEdit.kind === 'usb_can'" class="f-group">
@@ -974,11 +1110,11 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
         </datalist>
         <div class="f-row">
           <span class="f-lab">波特率</span>
-          <select v-model.number="connEdit.baud">
+          <select v-model.number="connEdit.baud" aria-label="波特率">
             <option v-for="b in baudOptions" :key="b" :value="b">{{ b }}</option>
           </select>
           <span class="f-lab f-lab2">校验</span>
-          <select v-model="connEdit.parity">
+          <select v-model="connEdit.parity" aria-label="校验">
             <option v-for="o in parityOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
           </select>
         </div>
@@ -989,12 +1125,13 @@ const serialBaudOptions = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 92
             <option :value="2">2</option>
           </select>
         </div>
-        <div v-if="connEdit.kind === 'serial_master'" class="f-row">
+        <div v-if="(connEdit.kind === 'serial_master' || connEdit.kind === 'dlt645_serial')" class="f-row">
           <span class="f-lab">超时(ms)</span>
           <input v-model.number="connEdit.timeoutMs" type="number" min="50" step="50" class="mono" />
-          <span class="tip-inline">请求超时+重试2次</span>
+          <span v-if="connEdit.kind === 'serial_master'" class="tip-inline">请求超时+重试2次</span>
         </div>
-        <p v-if="connEdit.kind === 'serial_master'" class="tip">主机连接：独占该串口，按设备点表轮询远端 RTU 从机（地址+CRC16 帧）。保存前可「检查串口」确认未被占用。</p>
+        <p v-if="connEdit.kind === 'dlt645_serial'" class="tip">串口参数需与电表一致。检查串口可用后，启动连接再读取表地址或指标。</p>
+        <p v-else-if="connEdit.kind === 'serial_master'" class="tip">主机连接：独占该串口，按设备点表轮询远端 RTU 从机（地址+CRC16 帧）。保存前可「检查串口」确认未被占用。</p>
         <p v-else class="tip">本机无 485 口时，可装 com0com 虚拟出串口对联调。</p>
       </div>
 

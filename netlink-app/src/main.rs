@@ -47,6 +47,8 @@ fn main() {
             commands::send_can_frame,
             commands::scan_points,
             commands::scan_cancel,
+            commands::read_dlt645_address,
+            commands::read_dlt645_point,
         ])
         .run(tauri::generate_context!())
         .expect("NetLink 启动失败");

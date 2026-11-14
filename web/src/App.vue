@@ -2,12 +2,13 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import ToolBar from './components/ToolBar.vue'
 import DeviceTree from './components/DeviceTree.vue'
+import Dlt645PointTable from './components/Dlt645PointTable.vue'
 import PointTable from './components/PointTable.vue'
 import FrameMonitor from './components/FrameMonitor.vue'
 import TestFramePanel from './components/TestFramePanel.vue'
 import CanSendPanel from './components/CanSendPanel.vue'
 import { api } from './api'
-import { store, applyUpdate, applyProjectHandle, refreshProjects } from './store'
+import { store, applyUpdate, applyProjectHandle, refreshProjects, selectedDlt645Meter } from './store'
 import { uiAlert } from './ui-dialog'
 
 let off: (() => void) | null = null
@@ -61,7 +62,8 @@ onUnmounted(() => off?.())
     <ToolBar />
     <div class="app-main">
       <DeviceTree class="app-tree panel" />
-      <PointTable class="app-points panel" />
+      <Dlt645PointTable v-if="selectedDlt645Meter" :key="selectedDlt645Meter.id" class="app-points panel" />
+      <PointTable v-else class="app-points panel" />
     </div>
     <FrameMonitor class="app-monitor panel" />
     <TestFramePanel />

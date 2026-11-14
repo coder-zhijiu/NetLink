@@ -47,6 +47,7 @@ fn project(conn_id: u64, transport: Transport, devices: Vec<Device>) -> ProjectS
             id: conn_id,
             name: "conn".into(),
             transport,
+            dlt645_meters: vec![],
             can_nodes: vec![],
             devices,
         }],

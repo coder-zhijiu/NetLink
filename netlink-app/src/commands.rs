@@ -282,6 +282,9 @@ pub async fn save_project(
     path: String,
     project: ProjectSpec,
 ) -> Result<ProjectHandle, String> {
+    for conn in &project.connections {
+        netlink_core::protocol::dlt645::validate(conn)?;
+    }
     do_save(state.inner(), &path, project)
 }
 
@@ -518,6 +521,7 @@ async fn ensure_runtime(app: &AppHandle, state: &AppState) -> RuntimeManager {
             ticker.tick().await;
             let dev = selected.load(Ordering::Acquire);
             let mut patch = Map::new();
+            patch.insert("dlt645_samples".into(), json!({ "meter_id": dev, "points": push_manager.snapshot_dlt645(dev) }));
             if dev != 0 {
                 let values = push_manager.snapshot_values(dev);
                 if !values.is_empty() {
@@ -687,6 +691,20 @@ pub async fn list_serial_ports() -> Vec<String> {
     serialport::available_ports()
         .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
         .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn read_dlt645_address(state: State<'_, AppState>, conn_id: u64) -> Result<String, String> {
+    let manager = state.manager.lock().await.clone().ok_or("645 连接未启动")?;
+    manager.read_dlt645_address(conn_id).await
+}
+
+#[tauri::command]
+pub async fn read_dlt645_point(
+    state: State<'_, AppState>, conn_id: u64, meter_id: u64, point_id: u64,
+) -> Result<(), String> {
+    let manager = state.manager.lock().await.clone().ok_or("645 连接未启动")?;
+    manager.read_dlt645_point(conn_id, meter_id, point_id).await
 }
 
 /// 主机侧写点位（在线值直写）

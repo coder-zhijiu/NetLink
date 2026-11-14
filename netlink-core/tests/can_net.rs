@@ -186,6 +186,7 @@ async fn can_net_start_succeeds_when_unreachable() {
         name: "不可达网关".into(),
         transport: Transport::CanNet { host: "127.0.0.1".into(), port, channel: 0, timeout_ms: 200 },
         devices: vec![],
+        dlt645_meters: vec![],
         can_nodes: vec![],
     };
     manager.start_connection(&conn).await.expect("can_net 启动应成功（连接循环异步重连）");

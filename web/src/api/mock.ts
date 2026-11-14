@@ -1,3 +1,4 @@
+import { isDlt645Transport, type Dlt645Meter, type Dlt645Point, type Dlt645Sample } from '../types'
 import type { NetLinkApi, RuntimePatch } from './contract'
 import type { Area, CanAgg, CanFrame, CanRxStat, DataType, Device, FrameRecord, Point, ProjectHandle, ProjectMeta, ProjectSpec, PointRow, ScanParams, ScanProgress, ScanRange, ScanResult, SheetParseResult, SourceKind, DevStat, Transport, TestConnResult } from '../types'
 import { canFrameNote, engToRaw, isCanTransport, isMasterTransport, rawToEng } from '../types'
@@ -224,7 +225,62 @@ export function createMockApi(): NetLinkApi {
     const conn = project?.connections.find((c) => c.id === connId)
     for (const d of conn?.devices ?? []) runningDevices.delete(d.id)
     for (const n of conn?.can_nodes ?? []) runningDevices.delete(n.id)
+    for (const meter of conn?.dlt645_meters ?? []) {
+      runningDevices.delete(meter.id)
+      dlt645Samples.delete(meter.id)
+      dlt645Due.delete(meter.id)
+    }
     for (const id of ids) runningDevices.add(id)
+  }
+
+  const dlt645Samples = new Map<number, Record<number, Dlt645Sample>>()
+  const dlt645Due = new Map<number, number>()
+  let selectedMeter = 0
+
+  const dlt645Connection = (connId: number) => {
+    const conn = project?.connections.find((c) => c.id === connId)
+    if (!conn || !isDlt645Transport(conn.transport.kind) || !runningConns.has(connId)) {
+      throw new Error('645 连接未启动')
+    }
+    return conn
+  }
+
+  function dlt645Frame(address: string, code: number, data: number[]) {
+    const addressBytes = address.match(/../g)?.reverse().map((x) => parseInt(x, 16)) ?? []
+    const frame = [0x68, ...addressBytes, 0x68, code, data.length, ...data.map((b) => (b + 0x33) & 0xff)]
+    return [0xfe, 0xfe, 0xfe, 0xfe, ...frame, frame.reduce((sum, b) => (sum + b) & 0xff, 0), 0x16]
+  }
+
+  function mockDlt645Read(connId: number, meter: Dlt645Meter, point: Dlt645Point) {
+    const di = (point.di.match(/../g) ?? []).reverse().map((x) => parseInt(x, 16))
+    const base = 1 + Number(meter.address.slice(-1))
+    const integer = Math.min(base, 9) * 3
+    const raw = integer / 10 ** point.decimals
+    const data = Array<number>(point.bytes).fill(0)
+    data[0] = point.format === 'bcd' || point.format === 'signed_bcd' ? parseInt(String(integer), 16) : integer
+    const points = dlt645Samples.get(meter.id) ?? {}
+    points[point.id] = { raw, value: raw * (point.scale ?? 1), last_ok_ms: Date.now(), error: null }
+    dlt645Samples.set(meter.id, points)
+    const note = `演示 · 表 ${meter.address} · DI ${point.di}`
+    emit({ frames: [
+      makeFrame('out', connId, meter.id, dlt645Frame(meter.address, 0x11, di), note),
+      makeFrame('in', connId, meter.id, dlt645Frame(meter.address, 0x91, [...di, ...data]), note),
+    ] })
+  }
+
+  function tickDlt645() {
+    const now = Date.now()
+    for (const conn of project?.connections ?? []) {
+      if (!runningConns.has(conn.id)) continue
+      for (const meter of conn.dlt645_meters ?? []) {
+        if (!runningDevices.has(meter.id) || now < (dlt645Due.get(meter.id) ?? 0)) continue
+        dlt645Due.set(meter.id, now + meter.poll_period_ms)
+        for (const point of meter.points) {
+          if (point.poll !== false) mockDlt645Read(conn.id, meter, point)
+        }
+      }
+    }
+    emit({ dlt645_samples: { meter_id: selectedMeter, points: { ...dlt645Samples.get(selectedMeter) } } })
   }
 
   const masterStats = new Map<number, DevStat>()
@@ -298,7 +354,9 @@ export function createMockApi(): NetLinkApi {
     const canPatch: Record<number, CanAgg> = {}
     const connStates: Record<number, { kind: 'connected'; detail: null }> = {}
     for (const conn of project?.connections ?? []) {
-      if (!isCanTransport(conn.transport.kind) || !runningConns.has(conn.id)) continue
+      if (!runningConns.has(conn.id)) continue
+      if (isDlt645Transport(conn.transport.kind)) connStates[conn.id] = { kind: 'connected', detail: null }
+      if (!isCanTransport(conn.transport.kind)) continue
       const agg = canAgg.get(conn.id) ?? newMockCanAgg()
 
       // ① 节点周期报文（在线节点 + 启用帧 + 周期 > 0）
@@ -333,13 +391,14 @@ export function createMockApi(): NetLinkApi {
       connStates[conn.id] = { kind: 'connected', detail: null }
     }
     if (frames.length > 0) emit({ frames })
-    if (Object.keys(canPatch).length > 0) emit({ can_rx: canPatch, conn_states: connStates })
+    emit({ can_rx: canPatch, conn_states: connStates })
   }
 
   const tickValues = () => {
     const now = performance.now()
     if (!paused) simMs += now - lastTick
     lastTick = now
+    tickDlt645()
     if (paused || !running()) return
     const t = simMs / 1000
     const patch: Record<number, number> = {}
@@ -745,14 +804,18 @@ export function createMockApi(): NetLinkApi {
       })
     },
     async start(p: ProjectSpec) {
+      project = clone(p)
       runningConns.clear()
       runningDevices.clear()
       canAgg.clear()
+      dlt645Samples.clear()
+      dlt645Due.clear()
       for (const c of p.connections) {
         runningConns.add(c.id)
         const ids = [
           ...c.devices.filter((d) => d.enabled).map((d) => d.id),
           ...(c.can_nodes ?? []).filter((n) => n.enabled).map((n) => n.id),
+          ...(c.dlt645_meters ?? []).filter((m) => m.enabled !== false && m.poll !== false).map((m) => m.id),
         ]
         setConnDevices(c.id, ids)
       }
@@ -760,13 +823,16 @@ export function createMockApi(): NetLinkApi {
       emitRun()
     },
     async startConn(p: ProjectSpec, connId: number, enabledDevices?: number[] | null) {
-      const conn = p.connections.find((c) => c.id === connId)
+      setConnDevices(connId, [])
+      project = clone(p)
+      const conn = project.connections.find((c) => c.id === connId)
       if (!conn) throw new Error('连接不存在')
       runningConns.add(connId)
       // 指定集合 = 单台对象首启；未指定按工程配置（设备与 CAN 节点同规则）
       const configured = [
         ...conn.devices.filter((d) => d.enabled).map((d) => d.id),
         ...(conn.can_nodes ?? []).filter((n) => n.enabled).map((n) => n.id),
+        ...(conn.dlt645_meters ?? []).filter((m) => m.enabled !== false && m.poll !== false).map((m) => m.id),
       ]
       const ids = enabledDevices ?? configured
       setConnDevices(connId, ids)
@@ -783,11 +849,13 @@ export function createMockApi(): NetLinkApi {
       runningConns.clear()
       runningDevices.clear()
       canAgg.clear()
+      dlt645Samples.clear()
+      dlt645Due.clear()
       emitRun()
     },
     async setDeviceEnabled(deviceId: number, enabled: boolean) {
       const conn = (project?.connections ?? []).find(
-        (c) => c.devices.some((d) => d.id === deviceId) || (c.can_nodes ?? []).some((n) => n.id === deviceId),
+        (c) => c.devices.some((d) => d.id === deviceId) || (c.can_nodes ?? []).some((n) => n.id === deviceId) || c.dlt645_meters?.some((m) => m.id === deviceId),
       )
       if (!conn) throw new Error('设备不在工程里')
       if (!runningConns.has(conn.id)) throw new Error('该设备所属连接未启动')
@@ -797,7 +865,7 @@ export function createMockApi(): NetLinkApi {
     },
     async testConnection(transport: Transport) {
       // 浏览器演示模式无法真正探测，给出诚实提示
-      if (transport.kind === 'tcp_client') {
+      if (transport.kind === 'tcp_client' || transport.kind === 'dlt645_tcp') {
         return { ok: true, message: `演示模式：未实际连接 ${transport.host ?? '?'}:${transport.port ?? 502}，假定远端可达`, latency_ms: 1 }
       }
       if (transport.kind === 'tcp_server') {
@@ -816,8 +884,25 @@ export function createMockApi(): NetLinkApi {
       lastTick = performance.now()
       emit({ paused: p })
     },
-    selectDevice(_deviceId) {
-      // mock 引擎全量计算，无需按设备切换
+    selectDevice(deviceId) {
+      selectedMeter = deviceId
+    },
+    async readDlt645Address(connId) {
+      const conn = dlt645Connection(connId)
+      const address = conn.dlt645_meters?.[0]?.address ?? '000000000001'
+      const data = (address.match(/../g) ?? []).reverse().map((x) => parseInt(x, 16))
+      emit({ frames: [
+        makeFrame('out', connId, undefined, dlt645Frame('AAAAAAAAAAAA', 0x13, []), '演示 · 读取通信地址'),
+        makeFrame('in', connId, undefined, dlt645Frame(address, 0x93, data), `演示 · 通信地址 ${address}`),
+      ] })
+      return address
+    },
+    async readDlt645Point(connId, meterId, pointId) {
+      const conn = dlt645Connection(connId)
+      const meter = conn.dlt645_meters?.find((m) => m.id === meterId)
+      const point = meter?.points.find((p) => p.id === pointId)
+      if (!meter || !point) throw new Error('点位不在该连接下')
+      mockDlt645Read(connId, meter, point)
     },
     async listSerialPorts() {
       // 浏览器演示模式拿不到真实串口，给两个假口演示表单交互

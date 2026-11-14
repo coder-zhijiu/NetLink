@@ -354,6 +354,7 @@ async fn unsupported_can_backends_rejected_at_start() {
             serial_baud: 115_200,
         },
         devices: vec![],
+        dlt645_meters: vec![],
         can_nodes: vec![],
     };
     let e = manager.start_connection(&conn).await.unwrap_err();
@@ -372,6 +373,7 @@ async fn unsupported_can_backends_rejected_at_start() {
             serial_baud: 115_200,
         },
         devices: vec![],
+        dlt645_meters: vec![],
         can_nodes: vec![],
     };
     let e = manager.start_connection(&conn).await.unwrap_err();
@@ -390,6 +392,7 @@ async fn unsupported_can_backends_rejected_at_start() {
             serial_baud: 115_200,
         },
         devices: vec![],
+        dlt645_meters: vec![],
         can_nodes: vec![node_of(1, true, vec![CanPeriodicFrame {
             id: 11,
             frame_id: 0x123,

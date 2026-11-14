@@ -1,8 +1,9 @@
-import type { ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, ConnState, DevStat, Transport, TestConnResult, CanAgg, CanFrame, ScanParams, ScanProgress, ScanResult } from '../types'
+import type { Dlt645Sample, ProjectSpec, ProjectMeta, ProjectHandle, PointRow, SheetParseResult, FrameRecord, ConnState, DevStat, Transport, TestConnResult, CanAgg, CanFrame, ScanParams, ScanProgress, ScanResult } from '../types'
 
 /** 运行时状态推送（mock 与 tauri 两种实现共用） */
 export interface RuntimePatch {
   frames?: FrameRecord[]
+  dlt645_samples?: { meter_id: number; points: Record<number, Dlt645Sample> }
   values?: Record<number, number>
   /** 寄存器原始值（与 values 同节奏；实时值悬浮换算提示用） */
   raws?: Record<number, number>
@@ -57,6 +58,9 @@ export interface NetLinkApi {
 
   /** 连接编辑器检测：主机=测试连接远端；从机=检查端口/串口占用 */
   testConnection(transport: Transport): Promise<TestConnResult>
+
+  readDlt645Address(connId: number): Promise<string>
+  readDlt645Point(connId: number, meterId: number, pointId: number): Promise<void>
 
   selectDevice(deviceId: number): void
 

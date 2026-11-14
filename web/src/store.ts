@@ -2,7 +2,7 @@ import { computed, reactive } from 'vue'
 import { api } from './api'
 import { uiAlert, uiConfirm } from './ui-dialog'
 import { areaGlobalAddr, isCanTransport, isMasterTransport } from './types'
-import type { Area, CanAgg, CanNode, CanPeriodicFrame, Connection, ConnState, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec, ScanProgress } from './types'
+import type { Dlt645Sample, Area, CanAgg, CanNode, CanPeriodicFrame, Connection, ConnState, DevStat, Device, FrameRecord, PointRow, ProjectHandle, ProjectMeta, ProjectSpec, ScanProgress } from './types'
 import type { RuntimePatch } from './api/contract'
 
 const FRAME_LIMIT = 5000
@@ -22,6 +22,7 @@ export const store = reactive({
   stats: {} as Record<number, DevStat>,
   /** 主机连接链路状态（conn_id → 状态；替换式，连接停止后消失） */
   connStates: {} as Record<number, ConnState>,
+  dlt645Samples: {} as Record<number, Dlt645Sample>,
   /** CAN 连接观测（conn_id → 聚合/帧率；替换式，连接停止后消失） */
   canRx: {} as Record<number, CanAgg>,
   /** 点位扫描进度（conn_id → 进度；替换式，扫描结束 = 空表） */
@@ -80,14 +81,13 @@ export function applyProjectHandle(h: ProjectHandle) {
   store.runningConns = []
   store.runningDevices = []
   store.paused = false
-  store.selectedDeviceId = firstSelectableId(h.spec)
-  if (store.selectedDeviceId != null) api.selectDevice(store.selectedDeviceId)
+  selectProjectObject(firstSelectableId(h.spec))
 }
 
 /** 工程里第一个可选中对象（设备或 CAN 节点；id 全局唯一） */
 function firstSelectableId(p: ProjectSpec): number | null {
   for (const c of p.connections) {
-    const dev = c.devices[0]?.id ?? c.can_nodes?.[0]?.id
+    const dev = c.devices[0]?.id ?? c.can_nodes?.[0]?.id ?? c.dlt645_meters?.[0]?.id
     if (dev != null) return dev
   }
   return null
@@ -108,7 +108,7 @@ function sanitizeIds(spec: ProjectSpec): void {
   }
   // 设备 / CAN 节点 id（共用空间）
   {
-    const objects = spec.connections.flatMap((c) => [...c.devices, ...(c.can_nodes ?? [])])
+    const objects = spec.connections.flatMap((c) => [...c.devices, ...(c.can_nodes ?? []), ...(c.dlt645_meters ?? [])])
     const seen = new Set<number>()
     let next = Math.max(200000 - 1, ...objects.map((o) => o.id)) + 1
     for (const o of objects) {
@@ -118,7 +118,7 @@ function sanitizeIds(spec: ProjectSpec): void {
   }
   // 点位 id（全工程唯一）
   {
-    const points = spec.connections.flatMap((c) => c.devices.flatMap((d) => d.points))
+    const points = spec.connections.flatMap((c) => [...c.devices, ...(c.dlt645_meters ?? [])].flatMap((d) => [...d.points]))
     const seen = new Set<number>()
     let next = Math.max(100000 - 1, ...points.map((p) => p.id)) + 1
     for (const p of points) {
@@ -213,6 +213,9 @@ export function applyUpdate(patch: RuntimePatch) {
   if (patch.running_conns) store.runningConns = patch.running_conns
   if (patch.running_devices) store.runningDevices = patch.running_devices
   if (patch.conn_states) store.connStates = patch.conn_states
+  if (patch.dlt645_samples?.meter_id === store.selectedDeviceId) {
+    store.dlt645Samples = patch.dlt645_samples.points
+  }
   if (patch.can_rx) store.canRx = patch.can_rx
   if (patch.scan) store.scanProgress = patch.scan
   if (patch.paused !== undefined) store.paused = patch.paused
@@ -233,7 +236,7 @@ export function deviceRunning(deviceId: number): boolean {
 /** 设备或 CAN 节点所属连接 */
 export function connOfId(id: number): Connection | null {
   for (const conn of store.project?.connections ?? []) {
-    if (conn.devices.some((d) => d.id === id) || (conn.can_nodes ?? []).some((n) => n.id === id)) return conn
+    if (conn.devices.some((d) => d.id === id) || (conn.can_nodes ?? []).some((n) => n.id === id) || conn.dlt645_meters?.some((m) => m.id === id)) return conn
   }
   return null
 }
@@ -242,7 +245,7 @@ export function connOfId(id: number): Connection | null {
 export function runningDevicesOfConn(connId: number): number[] {
   const conn = store.project?.connections.find((c) => c.id === connId)
   if (!conn) return []
-  const ids = [...conn.devices.map((d) => d.id), ...(conn.can_nodes ?? []).map((n) => n.id)]
+  const ids = [...conn.devices.map((d) => d.id), ...(conn.can_nodes ?? []).map((n) => n.id), ...(conn.dlt645_meters ?? []).map((m) => m.id)]
   return ids.filter((id) => store.runningDevices.includes(id))
 }
 
@@ -261,6 +264,12 @@ export async function restartConnIfRunning(connId: number, keep?: number[]) {
   } catch (e) {
     await uiAlert(`连接「${conn.name}」重启失败（已停止）：\n${e instanceof Error ? e.message : String(e)}`)
   }
+}
+
+export function selectProjectObject(id: number | null) {
+  store.selectedDeviceId = id
+  store.dlt645Samples = {}
+  api.selectDevice(id ?? 0)
 }
 
 export function clearFrames() {
@@ -295,6 +304,10 @@ export const selectedConnection = computed(() => {
   if (id == null) return null
   return connOfId(id)
 })
+
+export const selectedDlt645Meter = computed(() =>
+  selectedConnection.value?.dlt645_meters?.find((m) => m.id === store.selectedDeviceId) ?? null,
+)
 
 /** 选中设备是否属于主机连接（决定点表交互模式） */
 export const isSelectedMaster = computed(() => {
@@ -443,7 +456,7 @@ export function removePoint(deviceId: number, pointId: number) {
 
 /** 点位 id（全工程唯一） */
 export function nextPointId(): number {
-  const pts = (store.project?.connections ?? []).flatMap((c) => c.devices.flatMap((d) => d.points))
+  const pts = (store.project?.connections ?? []).flatMap((c) => [...c.devices, ...(c.dlt645_meters ?? [])].flatMap((d) => [...d.points]))
   return 1 + pts.reduce((m, p) => Math.max(m, p.id), 100000 - 1)
 }
 
@@ -479,11 +492,12 @@ export function removeConnection(id: number) {
   const selectedInRemoved =
     removed?.devices.some((d) => d.id === store.selectedDeviceId) ||
     (removed?.can_nodes ?? []).some((n) => n.id === store.selectedDeviceId) ||
+    removed?.dlt645_meters?.some((m) => m.id === store.selectedDeviceId) ||
     false
   const idx = p.connections.findIndex((c) => c.id === id)
   if (idx >= 0) p.connections.splice(idx, 1)
   if (selectedInRemoved) {
-    store.selectedDeviceId = firstSelectableId(p)
+    selectProjectObject(firstSelectableId(p))
   }
 }
 
@@ -502,7 +516,7 @@ export function removeDevice(deviceId: number) {
     if (idx >= 0) {
       conn.devices.splice(idx, 1)
       if (store.selectedDeviceId === deviceId) {
-        store.selectedDeviceId = allDevices()[0]?.id ?? firstSelectableId(store.project!) ?? null
+        selectProjectObject(allDevices()[0]?.id ?? firstSelectableId(store.project!))
       }
       return
     }
@@ -527,6 +541,7 @@ function allSelectableObjects(): Array<{ id: number }> {
   return (store.project?.connections ?? []).flatMap((c) => [
     ...c.devices,
     ...(c.can_nodes ?? []),
+    ...(c.dlt645_meters ?? []),
   ])
 }
 
@@ -549,7 +564,7 @@ export function removeCanNode(nodeId: number) {
     if (idx >= 0) {
       nodes.splice(idx, 1)
       if (store.selectedDeviceId === nodeId) {
-        store.selectedDeviceId = firstSelectableId(store.project!)
+        selectProjectObject(firstSelectableId(store.project!))
       }
       return
     }

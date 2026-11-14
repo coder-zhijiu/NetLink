@@ -36,6 +36,7 @@ fn slave_project() -> ProjectSpec {
             id: 4,
             name: "被扫从机".into(),
             transport: Transport::TcpServer { listen_addr: "127.0.0.1".into(), port: PORT },
+            dlt645_meters: vec![],
             can_nodes: vec![],
             devices: vec![Device {
                 id: 901,
@@ -99,6 +100,7 @@ fn master_project(port: u16, timeout_ms: u32) -> ProjectSpec {
             id: 5,
             name: "扫描主机".into(),
             transport: Transport::TcpClient { host: "127.0.0.1".into(), port, timeout_ms },
+            dlt645_meters: vec![],
             can_nodes: vec![],
             devices: vec![Device {
                 id: 902,

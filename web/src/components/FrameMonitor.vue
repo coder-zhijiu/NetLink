@@ -4,6 +4,7 @@ import { store, clearFrames } from '../store'
 import { api } from '../api'
 
 const autoScroll = ref(true)
+const filterConnId = ref<number | ''>('')
 const filterDeviceId = ref<number | ''>('')
 /** 面板视图：报文流（逐帧）/ ID 聚合（CAN 接收统计） */
 const view = ref<'stream' | 'agg'>('stream')
@@ -15,6 +16,7 @@ const bodyRef = ref<HTMLElement | null>(null)
 const deviceOptions = computed(() =>
   (store.project?.connections ?? []).flatMap((c) => [
     ...c.devices.map((d) => ({ id: d.id, name: `${c.name} / ${d.name}` })),
+    ...(c.dlt645_meters ?? []).map((m) => ({ id: m.id, name: `${c.name} / ${m.name}` })),
     ...(c.can_nodes ?? []).map((n) => ({ id: n.id, name: `${c.name} / ${n.name}` })),
   ]),
 )
@@ -23,6 +25,7 @@ const deviceName = computed(() => {
   const map = new Map<number, string>()
   for (const c of store.project?.connections ?? []) {
     for (const d of c.devices) map.set(d.id, d.name)
+    for (const m of c.dlt645_meters ?? []) map.set(m.id, m.name)
     for (const n of c.can_nodes ?? []) map.set(n.id, n.name)
   }
   return (id?: number) => (id != null ? (map.get(id) ?? `#${id}`) : '—')
@@ -30,6 +33,7 @@ const deviceName = computed(() => {
 
 const visibleFrames = computed(() => {
   let list = store.frames
+  if (filterConnId.value !== '') list = list.filter((f) => f.conn_id === filterConnId.value)
   if (filterDeviceId.value !== '') list = list.filter((f) => f.device_id === filterDeviceId.value)
   if (hideScan.value) list = list.filter((f) => !f.scan)
   // 只渲染尾部窗口，配合环形缓冲控制 DOM 数量
@@ -89,6 +93,10 @@ function fmtTime(ts: number): string {
         <span class="chip mono">{{ store.frames.length }}</span>
         <span class="dir-legend"><i class="in" />请求</span>
         <span class="dir-legend"><i class="out" />应答</span>
+        <select v-model="filterConnId" class="filter" aria-label="按连接过滤">
+          <option value="">全部连接</option>
+          <option v-for="c in store.project?.connections ?? []" :key="c.id" :value="c.id">{{ c.name }}</option>
+        </select>
         <select v-model="filterDeviceId" class="filter" title="按设备/CAN 节点过滤">
           <option value="">全部设备</option>
           <option v-for="o in deviceOptions" :key="o.id" :value="o.id">{{ o.name }}</option>

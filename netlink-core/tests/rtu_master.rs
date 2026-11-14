@@ -473,6 +473,7 @@ fn _unused_conn() -> Connection {
             stop_bits: 1,
             timeout_ms: 1000,
         },
+        dlt645_meters: vec![],
         can_nodes: vec![],
         devices: vec![],
     }

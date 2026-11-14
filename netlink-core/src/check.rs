@@ -31,13 +31,19 @@ impl TestConnResult {
 /// 按传输方式执行对应检测
 pub async fn test_transport(t: &Transport) -> TestConnResult {
     match t {
-        Transport::TcpClient { host, port, timeout_ms } => {
+        Transport::TcpClient { host, port, timeout_ms } | Transport::Dlt645Tcp { host, port, timeout_ms } => {
             test_tcp_client(host, *port, *timeout_ms).await
         }
         Transport::TcpServer { listen_addr, port } => test_tcp_server(listen_addr, *port).await,
         // 主机/从机串口共用占用检测：能否打开一次
         Transport::Serial { serial_port, baud, .. } | Transport::SerialMaster { serial_port, baud, .. } => {
             test_serial(serial_port, *baud)
+        }
+        Transport::Dlt645Serial { serial_port, baud, parity, stop_bits, .. } => {
+            match crate::protocol::modbus::rtu::open_port(serial_port, *baud, *parity, *stop_bits) {
+                Ok(_) => TestConnResult::ok(format!("串口「{serial_port}」可打开")),
+                Err(e) => TestConnResult::fail(e),
+            }
         }
         // slcan 后端检测串口占用；zlgcan/candle 未实现直接给出说明
         Transport::UsbCan { backend, serial_port, serial_baud, .. } => {

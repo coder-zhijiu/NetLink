@@ -57,6 +57,12 @@ export function createTauriApi(): NetLinkApi {
     async setPaused(paused) {
       await invoke('set_sim_paused', { paused })
     },
+    readDlt645Address(connId) {
+      return invoke<string>('read_dlt645_address', { connId })
+    },
+    readDlt645Point(connId, meterId, pointId) {
+      return invoke<void>('read_dlt645_point', { connId, meterId, pointId })
+    },
     selectDevice(deviceId) {
       void invoke('select_device', { deviceId }).catch(() => {})
     },

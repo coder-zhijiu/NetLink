@@ -4,7 +4,42 @@ export type Area = 'coil' | 'discrete_input' | 'holding_register' | 'input_regis
 export type DataType = 'u16' | 'i16' | 'u32' | 'i32' | 'f32' | 'u64' | 'i64' | 'f64'
 export type SourceKind = 'static' | 'sine' | 'ramp' | 'random_walk' | 'swing'
 export type FaultKind = 'normal' | 'timeout' | 'delay' | 'exception' | 'corrupt' | 'disconnect'
-export type TransportKind = 'tcp_server' | 'serial' | 'tcp_client' | 'serial_master' | 'usb_can' | 'can_net'
+export type TransportKind = 'tcp_server' | 'serial' | 'tcp_client' | 'serial_master' | 'usb_can' | 'can_net' | 'dlt645_serial' | 'dlt645_tcp'
+export function isDlt645Transport(kind: TransportKind): boolean {
+  return kind === 'dlt645_serial' || kind === 'dlt645_tcp'
+}
+
+export type Dlt645Format = 'bcd' | 'signed_bcd' | 'unsigned' | 'signed'
+
+export interface Dlt645Point {
+  id: number
+  name: string
+  di: string
+  format: Dlt645Format
+  bytes: number
+  decimals: number
+  unit: string
+  scale: number
+  poll: boolean
+}
+
+export interface Dlt645Meter {
+  id: number
+  name: string
+  address: string
+  enabled: boolean
+  poll: boolean
+  poll_period_ms: number
+  points: Dlt645Point[]
+}
+
+export interface Dlt645Sample {
+  raw: number | null
+  value: number | null
+  last_ok_ms: number | null
+  error: string | null
+}
+
 export type Parity = 'none' | 'even' | 'odd'
 /** USB-CAN 直采后端（v1 已实现 slcan；zlgcan/candle 待硬件到货） */
 export type CanBackend = 'slcan' | 'zlgcan' | 'candle'
@@ -137,6 +172,7 @@ export interface Connection {
   devices: Device[]
   /** CAN 连接下的节点（Modbus 连接恒为空数组） */
   can_nodes?: CanNode[]
+  dlt645_meters?: Dlt645Meter[]
 }
 
 export interface ProjectSpec {
@@ -267,7 +303,7 @@ export interface DevStat {
 
 /** 主机连接链路状态 */
 export interface ConnState {
-  kind: 'connecting' | 'connected' | 'reconnecting'
+  kind: 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
   /** 断开原因等细节（悬浮提示展示） */
   detail?: string | null
 }
@@ -311,6 +347,8 @@ export const TRANSPORT_LABELS: Record<TransportKind, string> = {
   serial_master: 'Modbus RTU 主机（串口 485 轮询）',
   usb_can: 'CAN 直采直控（USB-CAN）',
   can_net: 'CAN 转以太网（ZLG CANET）',
+  dlt645_serial: 'DL/T 645‑2007 串口主站',
+  dlt645_tcp: 'DL/T 645‑2007 TCP 透传主站',
 }
 
 export const AREA_LABELS: Record<Area, string> = {
